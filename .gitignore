@@ -1,0 +1,30 @@
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps
+v17
+out
+.vs
+cmake-build-debug
+starwars_anh.mpg
+.idea
+
+# Build output
+build/
+build-*/
+
+# Node dependencies
+node_modules/
+
+# Reference specs (ISO PDFs, not redistributable)
+docs/
+
+# Local test media
+testfiles/

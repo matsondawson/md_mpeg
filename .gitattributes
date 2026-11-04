@@ -1,0 +1,2 @@
+# Auto detect text files and perform LF normalization
+*.c,*.json,*.yaml,*.yml,*.cpp,*.h,*.hpp text eol=lf

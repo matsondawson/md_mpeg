@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=md_mpeg
+GenericName=MPEG-1 Player
+Comment=Play MPEG-1 video and MP2 audio files
+Exec=md_mpeg %f
+Icon=video-x-generic
+Terminal=false
+Categories=AudioVideo;Video;Player;
+MimeType=video/mpeg;video/x-mpeg;video/mpg;video/x-mpg;
+NoDisplay=false
