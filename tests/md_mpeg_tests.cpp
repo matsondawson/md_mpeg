@@ -146,7 +146,7 @@ struct Pipeline {
 	void runUntil(const int stopAfterFrames = INT_MAX) {
 		for (long iteration = 0; iteration < 20'000'000; iteration++) {
 			try {
-				if (demux.nextPacket(file) < 0) {
+				if (demux.nextPacket(file) == Mpeg1::DemuxResult::EndOfStream) {
 					while (audio.hasPendingFrame()) {
 						audio.executeCallbacks();
 					}

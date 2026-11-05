@@ -211,7 +211,7 @@ int main(int argc, char *argv[]) {
 
 		try {
 			if (!endOfStream) {
-				endOfStream = mps.nextPacket(fs) < 0;
+				endOfStream = mps.nextPacket(fs) == Mpeg1::DemuxResult::EndOfStream;
 			} else if (!streamFailed) {
 				// Decode audio frames that were waiting for space in the sound buffer
 				audioDecoder.executeCallbacks();

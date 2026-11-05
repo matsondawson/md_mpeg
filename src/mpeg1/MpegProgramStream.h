@@ -26,6 +26,16 @@ namespace Mpeg1 {
 	constexpr bool isVideoStream(const uint32_t startCode) { return (startCode & ~0xF) == VIDEO_STREAM_1_START_CODE; }
 	constexpr bool isAudioStream(const uint32_t startCode) { return (startCode & ~0x1F) == AUDIO_STREAM_1_START_CODE; }
 
+	// Result of MpegProgramStream::nextPacket
+	enum class DemuxResult {
+		// Call again: data was demuxed, or more input or decoder space may be available next time
+		Continue,
+		// A packet header is incomplete and the last call read no input
+		WaitingForInput,
+		// All input has been demuxed
+		EndOfStream
+	};
+
 	class IDecode {
 	public:
 		virtual ~IDecode() = default;
@@ -66,8 +76,6 @@ namespace Mpeg1 {
 	class MpegProgramStream {
 		MStream::RingBufferWithStartCodeEvent<2048> m_buffer;
 
-		double pts, dts;
-
 		uint32_t m_bitCount, m_bitsLeft;
 		int32_t m_streamingPacketBytesRemaining;
 
@@ -99,8 +107,7 @@ namespace Mpeg1 {
 
 	public:
 		MpegProgramStream()
-			: pts(-1), dts(-1)
-			  , m_bitCount(0)
+			: m_bitCount(0)
 			  , m_bitsLeft(0)
 			  , m_streamingPacketBytesRemaining(0)
 			  , m_ptrCurrentDecoderStream(nullptr)
@@ -147,7 +154,7 @@ namespace Mpeg1 {
 		 *
 		 * @param inputStream Pointer to stream to get data
 		 */
-		double nextPacket(MStream::IReadByteStream &inputStream) {
+		DemuxResult nextPacket(MStream::IReadByteStream &inputStream) {
 			// Let a decoder that was waiting on output space (audio backpressure) make progress
 			m_ptrAudioDecoderStream->executeCallbacks();
 
@@ -178,7 +185,7 @@ namespace Mpeg1 {
 						}
 						return endOfStream();
 					}
-					return true;
+					return DemuxResult::Continue;
 				}
 				if (m_syncSkippedBytes && !m_expectSyncSkip) {
 					std::cout << "Stream corruption, skipped " << m_syncSkippedBytes << " bytes to the next start code" << std::endl;
@@ -235,16 +242,16 @@ namespace Mpeg1 {
 					}
 
 					if (!streamFilled) {
-						return false;
+						return DemuxResult::WaitingForInput;
 					}
-					return true;
+					return DemuxResult::Continue;
 				} catch (const CorruptPacketException &ex) {
 					// Drop the packet; the next call seeks to the next valid start code
 					m_buffer.clearMark();
 					m_ptrCurrentDecoderStream = nullptr;
 					m_streamingPacketBytesRemaining = 0;
 					std::cout << "Corrupt packet, skipping: " << ex.what() << std::endl;
-					return true;
+					return DemuxResult::Continue;
 				}
 			}
 			// ?? what's this for?
@@ -270,7 +277,7 @@ namespace Mpeg1 {
 					m_ptrCurrentDecoderStream->executeCallbacks();
 					if (m_ptrCurrentDecoderStream->isFull()) {
 						// Decoder is applying backpressure, try again later
-						return true;
+						return DemuxResult::Continue;
 					}
 				}
 				while (!m_buffer.isEmpty() && packetWriteBytes) {
@@ -297,23 +304,22 @@ namespace Mpeg1 {
 			}
 			assert(m_streamingPacketBytesRemaining >= 0);
 
-			return true;
+			return DemuxResult::Continue;
 		}
 
 		/**
 		 * All input has been demuxed. Lets the video decoder finish its last pictures.
 		 * Audio frames are complete as they arrive, apart from any waiting on output space, which the
 		 * caller drains via the audio decoder's executeCallbacks().
-		 * @return -1, end of stream
 		 */
-		double endOfStream() {
+		DemuxResult endOfStream() {
 			m_ptrCurrentDecoderStream = nullptr;
 			m_streamingPacketBytesRemaining = 0;
 			if (!m_endOfStreamFlushed) {
 				m_endOfStreamFlushed = true;
 				m_ptrVideoDecoderStream->flush();
 			}
-			return -1;
+			return DemuxResult::EndOfStream;
 		}
 
 		/**
@@ -517,23 +523,22 @@ namespace Mpeg1 {
 			// pts_dts_marker
 			switch (pullBits(2)) {
 				case 0x00: {
-					pts = -1;
 					break;
 				}
 				case 0x02: {
-					pts = decodeTime();
+					const int32_t pts = decodeTime();
 					m_ptrCurrentDecoderStream->setPts(pts);
 					if (!audio) m_lastVideoPtsMillis = pts;
 					break;
 				}
 				case 0x03: {
-					pts = decodeTime(); // 36 bits
+					const int32_t pts = decodeTime(); // 36 bits
 					if (pullBits(4) != 1) {
 						throw CorruptPacketException("Invalid pts marker bit");
 					}
 					m_ptrCurrentDecoderStream->setPts(pts);
 					if (!audio) m_lastVideoPtsMillis = pts;
-					dts = decodeTime();
+					decodeTime(); // DTS, not used
 					break;
 				}
 				default: // 0x01
