@@ -30,7 +30,7 @@ namespace Mpeg1 {
 	enum class DemuxResult {
 		// Call again: data was demuxed, or more input or decoder space may be available next time
 		Continue,
-		// A packet header is incomplete and the last call read no input
+		// A packet header is incomplete and this call read no input
 		WaitingForInput,
 		// All input has been demuxed
 		EndOfStream
@@ -44,6 +44,7 @@ namespace Mpeg1 {
 		virtual void nextFrame() = 0;
 	};
 
+	// Discards everything, for packets of streams that aren't decoded
 	class NullDecoderStream final : public MStream::IWriteByteStream {
 	public:
 		NullDecoderStream() = default;
@@ -81,7 +82,7 @@ namespace Mpeg1 {
 
 		bool m_endOfStreamFlushed = false;
 
-		// For seeking: bytes read from the input since the last seek, and the position/SCR of the latest pack
+		// For seeking: file position of the next byte read, and the position/SCR of the latest pack
 		int64_t m_inputPosition = 0;
 		int64_t m_lastPackPosition = -1;
 		int64_t m_lastScrMillis = -1;
@@ -149,10 +150,11 @@ namespace Mpeg1 {
 
 		/**
 		 * Demuxes the next chunk of the input into the decoders.
-		 * Pacing comes from the decoders: the video frame callback blocks until a frame is due, and the
-		 * audio decoder reports isFull() while its output buffer can't take another frame.
+		 * Pacing comes from the decoders: the video frame callback can block while its consumer is busy (the
+		 * player's frame queue is full), and the audio decoder reports isFull() while its output buffer can't
+		 * take another frame.
 		 *
-		 * @param inputStream Pointer to stream to get data
+		 * @param inputStream Source of program stream bytes
 		 */
 		DemuxResult nextPacket(MStream::IReadByteStream &inputStream) {
 			// Let a decoder that was waiting on output space (audio backpressure) make progress
@@ -227,7 +229,7 @@ namespace Mpeg1 {
 
 					m_buffer.clearMark();
 				} catch ([[maybe_unused]] const MStream::EndOfData &ex) {
-					// Ringbuffer empty
+					// Header not fully buffered: rewind and retry on the next call
 					m_buffer.reset();
 					m_streamingPacketBytesRemaining = m_streamingPacketBytesRemainingMark;
 					// The header may have selected a stream before running out, so parse it again next time
@@ -246,7 +248,7 @@ namespace Mpeg1 {
 					}
 					return DemuxResult::Continue;
 				} catch (const CorruptPacketException &ex) {
-					// Drop the packet; the next call seeks to the next valid start code
+					// Drop the packet; the next call scans for the next valid start code
 					m_buffer.clearMark();
 					m_ptrCurrentDecoderStream = nullptr;
 					m_streamingPacketBytesRemaining = 0;
@@ -254,7 +256,7 @@ namespace Mpeg1 {
 					return DemuxResult::Continue;
 				}
 			}
-			// ?? what's this for?
+			// Packet lengths are 16 bits, so this only catches logic errors
 			assert(m_streamingPacketBytesRemaining < 0xFFFFFF);
 
 			if (inputStream.isEmpty() && m_buffer.isEmpty()) {
@@ -262,8 +264,7 @@ namespace Mpeg1 {
 				return endOfStream();
 			}
 
-			// We have a decoderStream here
-			// if streaming packet add this data to active stream
+			// If packet bytes remain there is a current stream. Pack and system headers leave none.
 			uint32_t packetWriteBytes = (m_streamingPacketBytesRemaining < m_buffer.used())
 				                            ? m_streamingPacketBytesRemaining
 				                            : m_buffer.used();
@@ -363,6 +364,7 @@ namespace Mpeg1 {
 		/**
 		 * Estimates the file position holding data for presentation time targetPtsMillis, from the latest
 		 * pack's position and SCR, the average byte rate, and how far video PTS run ahead of the SCR.
+		 * @param targetPtsMillis Presentation time to seek to
 		 * @return byte position, or -1 if nothing is known yet
 		 */
 		[[nodiscard]] int64_t estimateBytePosition(const int64_t targetPtsMillis) const {
@@ -402,7 +404,7 @@ namespace Mpeg1 {
 
 		uint32_t pullBits(const uint32_t readBitCount) {
 			assert(readBitCount > 0);
-			// More than 24 and we could have on overflow on pull
+			// More than 24 could overflow m_bitsLeft, which can already hold 7 bits
 			assert(readBitCount <= 24);
 
 			// TODO optimize to pull(N)
@@ -415,7 +417,8 @@ namespace Mpeg1 {
 			return (m_bitsLeft >> m_bitCount) & ((1 << readBitCount) - 1);
 		}
 
-		// TODO this is not integer friendly !! :\ 36 bits
+		// Reads a 36-bit field, a 33-bit time in 90 kHz ticks and 3 marker bits, and returns it in ms.
+		// The 33-bit time needs an int64_t.
 		int32_t decodeTime() {
 			int64_t clock = static_cast<int64_t>(pullBits(3)) << 30;
 			streamMarkerBit();
@@ -436,8 +439,7 @@ namespace Mpeg1 {
 			}
 			const auto system_clock_reference_base_highest = (t >> 1) & 7;
 
-			// buffer.pull(15); // system_clock_reference_base [29..15]
-			// MARKER_BIT;
+			// 15:system_clock_reference_base[29..15] / 1:marker bit
 			auto system_clock_reference_base_high = m_buffer.pull(2);
 			if (!(system_clock_reference_base_high & 1)) {
 				throw CorruptPacketException("Marker bit not 1");
@@ -495,7 +497,7 @@ namespace Mpeg1 {
 				throw CorruptPacketException("reserved byte not 127");
 			}
 
-			// skip stream bound entriess
+			// skip stream bound entries
 			while (m_streamingPacketBytesRemaining >= 3) {
 				// TODO validate stream bound entries?
 				skip(3);
@@ -516,8 +518,8 @@ namespace Mpeg1 {
 
 			m_bitsLeft = m_bitCount = 0;
 
-			// skip P-STD
-			// TODO I'm not sure how this affects alignment if this occurs
+			// Optional P-STD fields: '01' and 14 bits. Pulling 16 also takes the top 2 bits of the next field,
+			// so the position after this matches the case without them.
 			if (pullBits(2) == 1) {
 				pullBits(16);
 			}
@@ -550,7 +552,7 @@ namespace Mpeg1 {
 	};
 
 	/**
-	 * Finds the last pack header in the file by scanning backwards from the end.
+	 * Finds the last pack header in the last 256 KiB of the file, scanning backwards from the end.
 	 * Leaves the file positioned at the start.
 	 * @return {byte position, SCR in ms}, or {-1, -1} if none was found
 	 */

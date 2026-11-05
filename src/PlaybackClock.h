@@ -66,6 +66,7 @@ public:
 		return m_usingAudio;
 	}
 
+	// Current position in ms. Also switches between the audio and wall clocks.
 	int64_t ms() {
 		if (m_paused) {
 			return m_pausedAtMs;

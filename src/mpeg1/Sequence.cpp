@@ -9,6 +9,7 @@
 		throw std::runtime_error("Marker bit not 1"); \
 	}
 
+// Pel aspect ratio by aspect_ratio_information, 0 = forbidden or reserved
 static const float ASPECT_RATIOS[] = {
 	0,
 	1,
@@ -28,6 +29,7 @@ static const float ASPECT_RATIOS[] = {
 	0
 };
 
+// Frames per second by frame_rate code, 0 = forbidden or reserved
 static const float FRAME_RATES[] = {
 	0,
 	23.976f,
@@ -47,6 +49,7 @@ static const float FRAME_RATES[] = {
 	0
 };
 
+// Default intra quantizer matrix, in raster order
 static const uint8_t VIDEO_INTRA_QUANT_MATRIX[] = {
 	 8, 16, 19, 22, 26, 27, 29, 34,
 	16, 16, 22, 24, 27, 29, 34, 37,
@@ -67,6 +70,7 @@ void Mpeg1VideoDecoder::decodeSequence() {
 	frame_rate_enum = m_bitStream.pull(4);
 	m_frame_rate = FRAME_RATES[frame_rate_enum];
 	m_frame_period_millis = m_frame_rate != 0 ? 1000.0f / m_frame_rate : 0.0f;
+	// Units of 400 bit/s
 	bit_rate = m_bitStream.pull(18);
 	if (bit_rate == 0x3FFFF) {
 		// variable bit rate
@@ -76,8 +80,10 @@ void Mpeg1VideoDecoder::decodeSequence() {
 		bit_rate *= 400;
 	}
 	MARKER_BIT;
+	// Units of 16 kbit, stored as KB
 	vbv_buffer_size = m_bitStream.pull(10) * 2;
-	m_bitStream.pull(1); // constrain parameters flag
+	m_bitStream.pull(1); // constrained_parameters_flag
+	// Loaded matrices are in zig-zag order
 	load_intra_matrix = m_bitStream.pull(1);
 	if (load_intra_matrix) {
 		for (int i = 0; i < 64; i++) {

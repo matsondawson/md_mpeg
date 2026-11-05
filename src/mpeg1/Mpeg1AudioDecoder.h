@@ -19,8 +19,8 @@ using audio_real_t = float;
 
 typedef struct quantizer_spec_t {
 	unsigned short levels;
-	unsigned char group;
-	unsigned char bits;
+	unsigned char group; // 1: three samples share one code
+	unsigned char bits; // code length
 } quantizer_spec_t;
 
 
@@ -32,6 +32,7 @@ private:
 
 	AudioSampleBuffer m_soundBuffer;
 
+	// Set by the first valid header, after which the sample rate and channel count can't change
 	bool m_hasLoggedHeaderInfo = false;
 
 	// PTS of the first decoded audio frame, -1 until known
@@ -60,18 +61,24 @@ private:
 	uint32_t m_samplingFrequency = 0;
 	uint32_t m_frameSize = 0;
 
-	// derived
+	// First subband whose samples both channels share (joint stereo)
 	uint8_t m_bound = 0;
 
-	// from plm
+	// Synthesis filter state, adapted from PL_MPEG
+	// Write position in V
 	int v_pos = 0;
 
+	// By channel, subband. allocation is null if the subband has no bits.
 	const quantizer_spec_t* allocation[2][32]{nullptr};
 	uint8_t scale_factor_info[2][32]{0};
+	// By channel, subband, part
 	uint8_t m_scale_factor[2][32][3]{0};
+	// By channel, subband, sample
 	int sample[2][32][3]{0};
 
+	// Matrix transform output by channel, a ring of 16 blocks of 64
 	audio_real_t V[2][1024]{0};
+	// Windowed output of one 32-sample block
 	audio_real_t U[32]{0};
 
 public:

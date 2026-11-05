@@ -65,6 +65,7 @@ static inline uint8_t clampToByte(int32_t n) {
 	return (n > 255) ? 255 : (n < 0) ? 0 : n;
 }
 
+// In-place 8x8 inverse DCT. block holds 64 premultiplied coefficients in raster order, and receives the samples.
 void video_idct(int *block) {
 	int b1, b3, b4, b6, b7, tmp1, tmp2, m0,
 			x0, x1, x2, x3, x4, y3, y4, y5, y6, y7;
@@ -174,7 +175,7 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 		PULL2(full_pel_forward_vector, 1, forward_f_code, 3);
 
 		assert(forward_f_code != 0);
-		// forward f_code 1 -> 6
+		// f_code is 1..7, so r_size is 0..6
 		forward_r_size = forward_f_code - 1;
 
 		if (picture_coding_type == VideoPictureType_B) {
@@ -190,17 +191,7 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 		}
 	}
 
-	if (nextStartCode(EXTENSION_START_CODE)) {
-		while (m_bitStream.peek(24) == 1) {
-			m_bitStream.pull(8);
-		}
-	}
-
-	if (nextStartCode(USER_START_CODE)) {
-		while (m_bitStream.peek(24) == 1) {
-			m_bitStream.pull(8);
-		}
-	}
+	skipExtensionAndUserData();
 
 	while (nextStartCodeRange(SLICE_START_CODE_START, SLICE_START_CODE_END)) {
 		processSlice(lastStartCode() & 255);
@@ -402,7 +393,7 @@ void Mpeg1VideoDecoder::predictMacroblock() const {
 			videoCopyMacroblock(bw_h, bw_v, m_ptrFrameFuture);
 		}
 	} else {
-		// P copies from forward?
+		// P pictures predict from the past frame, using forward vectors
 		videoCopyMacroblock(fw_h, fw_v, m_ptrFramePast);
 	}
 }
@@ -451,7 +442,7 @@ void Mpeg1VideoDecoder::videoProcessMacroblock(uint8_t *d, const uint8_t *s, con
 	}
 
 	const auto odd_h = (motion_h & 1) << 1, odd_v = (motion_v & 1);
-	// odd_h cannot be anothing other than 0->3
+	// Half pel flags: odd_h | odd_v is always 0..3
 	// ReSharper disable once CppDefaultCaseNotHandledInSwitchStatement
 	switch (odd_h | odd_v) {
 		case 0:
@@ -524,7 +515,7 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 				                       ? decodeDCTDCSizeLuminance()
 				                       : decodeDCTDCSizeChrominance();
 
-			// !!! block_data[0] is dc coefficient of macroblock
+			// block_data[0] is the block's DC coefficient
 			if (dct_dc_size != 0) {
 				auto dct_dc_differential = static_cast<int32_t>(m_bitStream.pull(dct_dc_size));
 				if (dct_dc_differential & (1 << (dct_dc_size - 1))) {
@@ -576,6 +567,7 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 		}
 
 		if (picture_coding_type != VideoPictureType_D) {
+			// '10' is end_of_block
 			while (m_bitStream.peek(2) != 2) {
 				// TODO not sure dct_coeff_next needs to be returned
 				RunLevel runLevel = decodeDCTCoeff(false);
@@ -688,14 +680,14 @@ uint32_t Mpeg1VideoDecoder::decodeDCTDCSizeLuminance() {
 	return value >> 4;
 }
 
-// This table is hit 99.7% of the time
+// 93-100% of lookups end here on the test files
 const uint8_t s_dctDcSizeChrominance[] =
 {
 	0x02, 0x02, 0x02, 0x02, 0x12, 0x12, 0x12, 0x12,
 	0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x44, 0x00
 };
 
-// This table is hit 0.3% of the time
+// 0.1-7.3% of lookups on the test files
 const uint8_t s_dctDcSizeChrominance1[] =
 {
 	0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
@@ -827,14 +819,23 @@ VLC code	macroblock_quant	macroblock_motion_forward	macroblock_motion_backward	m
 010			0					0							1							0					0
 011			0					0							1							1					0
 0010		0					1							0							0					0
+0011		0					1							0							1					0
+00011		0					0							0							0					1
+00010		1					1							1							1					0
+000011		1					1							0							1					0
+000010		1					0							1							1					0
+000001		1					0							0							0					1
 */
 
 /*const uint8_t s_macroblockTypeI[] =
 {
 	0x00, 0x12, 0x01, 0x01
 };*/
+// One byte per 2-bit code, by code value: bits 0-1 code length, bit 2 macroblock_quant
 const static uint32_t s_macroblockTypeI = 0 + (((1 << 2) + 2) << 8) + (1 << 16) + (1 << 24);
 
+// Indexed by the next 6 bits, codes starting with 1 are handled in decodeMacroblockType.
+// High byte: bit 4 macroblock_quant, 3 forward, 2 backward, 1 pattern, 0 intra. Low byte: code length.
 const static uint16_t s_macroblockTypeP[] =
 {
 	0x0000, 0x1106, 0x1205, 0x1205, 0x1a05, 0x1a05, 0x0105, 0x0105,
@@ -843,6 +844,7 @@ const static uint16_t s_macroblockTypeP[] =
 	0x0202, 0x0202, 0x0202, 0x0202, 0x0202, 0x0202, 0x0202, 0x0202
 };
 
+// Same format as s_macroblockTypeP
 const static uint16_t s_macroblockTypeB[] =
 {
 	0x0000, 0x1106, 0x1606, 0x1a06, 0x1e05, 0x1e05, 0x0105, 0x0105,
@@ -922,12 +924,14 @@ void Mpeg1VideoDecoder::decodeMacroblockType() {
 		", macroblock_intra=" << macroblock_intra << std::endl;
 }
 
+// Address increment tables. High byte: increment, or 34 for stuffing, 35 for escape. Low byte: code length.
+// Next1 and Next2 continue in s_macroblockAddressIncrement1 and s_macroblockAddressIncrement2.
 static constexpr uint16_t Next1 = (uint16_t) 0xfffe;
 static constexpr uint16_t Next2 = (uint16_t) 0xffff;
-static constexpr uint16_t Escape = (uint16_t) 0x230b; // 0x080b;
-static constexpr uint16_t Stuffing = (uint16_t) 0x220b; // 0x0f0b;
+static constexpr uint16_t Escape = (uint16_t) 0x230b;
+static constexpr uint16_t Stuffing = (uint16_t) 0x220b;
 
-// 99.97% hit rate
+// Indexed by the top 5 of 11 bits. 95-99% of lookups end here on the test files.
 constexpr uint16_t s_macroblockAddressIncrement[] =
 {
 	Next1, Next2, 0x0705, 0x0605, 0x0504, 0x0504, 0x0404, 0x0404,
@@ -936,7 +940,7 @@ constexpr uint16_t s_macroblockAddressIncrement[] =
 	0x0101, 0x0101, 0x0101, 0x0101, 0x0101, 0x0101, 0x0101, 0x0101
 };
 
-// 0.03% hit rate
+// Next2, indexed by the low 6 of 11 bits. 0-2.2% of lookups on the test files.
 constexpr uint16_t s_macroblockAddressIncrement2[] =
 {
 	0x0d08, 0x0d08, 0x0d08, 0x0d08, 0x0d08, 0x0d08, 0x0d08, 0x0d08,
@@ -949,7 +953,7 @@ constexpr uint16_t s_macroblockAddressIncrement2[] =
 	0x0807, 0x0807, 0x0807, 0x0807, 0x0807, 0x0807, 0x0807, 0x0807
 };
 
-// 0.03% hit rate
+// Next1, indexed by the low 6 of 11 bits. 0-3.1% of lookups on the test files.
 constexpr uint16_t s_macroblockAddressIncrement1[] =
 {
 	0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
@@ -1179,12 +1183,14 @@ const RunLevel s_dctCoefficients4[] =
 	{0, 4, 8}, {0, -4, 8}, {8, 1, 8}, {8, -1, 8}
 };
 
+// 0001 xxs? ???? ???? ?
 const RunLevel dctCoefficientsA[] =
 {
 	{7, 1, 7}, {7, -1, 7}, {6, 1, 7}, {6, -1, 7},
 	{1, 2, 7}, {1, -2, 7}, {5, 1, 7}, {5, -1, 7}
 };
 
+// 0010 xxxx s??? ???? ?
 const RunLevel dctCoefficientsB[] =
 {
 	{13, 1, 9}, {13, -1, 9}, {0, 6, 9}, {0, -6, 9}, {12, 1, 9}, {12, -1, 9}, {11, 1, 9}, {11, -1, 9},
@@ -1193,6 +1199,7 @@ const RunLevel dctCoefficientsB[] =
 	{0, -3, 6}, {0, -3, 6}, {0, -3, 6}, {0, -3, 6}, {0, -3, 6}, {0, -3, 6}, {0, -3, 6}, {0, -3, 6},
 };
 
+// 0011 xs?? ???? ???? ?
 const RunLevel dctCoefficientsC[] =
 {
 	{4, 1, 6}, {4, -1, 6}, {3, 1, 6}, {3, -1, 6}
@@ -1203,26 +1210,27 @@ RunLevel Mpeg1VideoDecoder::decodeDCTCoeff(const bool first) {
 	int index = (value >> 5);
 	RunLevel result;
 	if (index >= 0x1 && index <= 0xf) {
-		// 3% hit rate
+		// 1.9-4.7% of lookups on the test files
 		int offset = (index << 5); // Multiply by 32, the size of each original array
 		offset += (value & 0x1f); // Get 5 least significant bits, which determine the offset within each array
 		result = s_dctCoefficients[offset];
 	} else if (index >= 0x10 && index <= 0x1f) {
-		// 3.4%
+		// 2.2-3.9%
 		// Discard 4 least significant bits
 		const int offset = (value >> 4) & 0x1f;
 		result = s_dctCoefficients1[offset];
 	} else if (index >= 0x20 && index <= 0x2f) {
-		// 1.3%
+		// 1.2-1.7%
 		// Discard 6 least significant bits
 		const int offset = (value >> 6) & 0x7;
 		result = s_dctCoefficients2[offset];
 	} else if (index >= 0x30 && index <= 0x3f) {
-		// 1.16%
+		// 0.5-1.5%
 		// Discard 6 least significant bits
 		const int offset = (value >> 6) & 0x7;
 		result = s_dctCoefficients3[offset];
 	} else if (index >= 0x40 && index <= 0xff) {
+		// 5-7%
 		// Discard 9 least significant bits
 		const int offset = (value >> 9) & 0xf;
 		result = s_dctCoefficients4[offset];

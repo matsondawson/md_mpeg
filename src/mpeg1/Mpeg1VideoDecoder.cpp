@@ -24,7 +24,6 @@ Mpeg1VideoDecoder::Mpeg1VideoDecoder()
 	  , macroblock_address(0), macroblock_intra(false), macroblock_motion_backward(false),
 	  macroblock_motion_forward(false)
 	  , next_start_code(-1) {
-	// Create writeable bitstream
 }
 
 int32_t Mpeg1VideoDecoder::getPts(const int32_t frameTimeMillis) {
@@ -96,8 +95,8 @@ void Mpeg1VideoDecoder::decodeOrResync() {
 
 /**
  * Discards data up to the next picture, group of pictures or sequence header (only a sequence header
- * if none has been seen yet), leaving that start code unread. If none is buffered yet, everything is
- * discarded and decoding resumes once more data arrives.
+ * if none has been seen yet), leaving that start code unread. If none is buffered yet, all but the last
+ * 3 bytes are discarded and decoding resumes once more data arrives.
  * Pictures that predict from a corrupt frame show errors until the next I-frame.
  */
 void Mpeg1VideoDecoder::resync() {
@@ -144,7 +143,7 @@ bool Mpeg1VideoDecoder::nextStartCode(const uint32_t expected_start_code) {
 		m_bitStream.align8();
 		next_start_code = m_bitStream.pull(32);
 		// std::cout << "next_start_code=" << std::hex << next_start_code << std::endl;
-		// should block if no more data
+		// Throws EndOfData if no more data
 	}
 	if (next_start_code == expected_start_code) {
 		last_start_code = next_start_code;
@@ -172,7 +171,7 @@ uint32_t Mpeg1VideoDecoder::lastStartCode() const {
 }
 
 /**
- * Converts a decoded frame to RGB, m_width x m_height pixels packed with no padding.
+ * Converts a decoded frame to 0x00RRGGBB, m_width x m_height pixels packed with no padding.
  * The decoded planes are padded to whole macroblocks, so each plane is read with its own stride.
  */
 void Mpeg1VideoDecoder::generateRgbFrameData(uint32_t *rgbData, const Frame &frame) const {
@@ -181,6 +180,7 @@ void Mpeg1VideoDecoder::generateRgbFrameData(uint32_t *rgbData, const Frame &fra
 	const uint32_t lumaStride = frame.m_frameSize.luma_width;
 	const uint32_t chromaStride = frame.m_frameSize.chroma_width;
 
+	// BT.601 limited range YCbCr to RGB, constants are Q16
 	const auto toRgb = [](const uint8_t luma, const int32_t r, const int32_t g, const int32_t b) -> uint32_t {
 		const int32_t y = (static_cast<int32_t>(luma) - 16) * 76309;
 		const uint32_t rr = std::clamp((y + r) >> 16, 0, 255);
@@ -211,6 +211,20 @@ void Mpeg1VideoDecoder::generateRgbFrameData(uint32_t *rgbData, const Frame &fra
 	}
 }
 
+void Mpeg1VideoDecoder::skipExtensionAndUserData() {
+	if (nextStartCode(EXTENSION_START_CODE)) {
+		while (m_bitStream.peek(24) != 1) {
+			m_bitStream.pull(8);
+		}
+	}
+
+	if (nextStartCode(USER_START_CODE)) {
+		while (m_bitStream.peek(24) != 1) {
+			m_bitStream.pull(8);
+		}
+	}
+}
+
 bool Mpeg1VideoDecoder::decodeFrame2() {
 	m_ptrRenderFrame = nullptr;
 	bool decodedAFrame = false;
@@ -218,7 +232,7 @@ bool Mpeg1VideoDecoder::decodeFrame2() {
 idle:
 	if (m_decodeState == IDLE) {
 		if (nextStartCode(0)) {
-			// finished
+			// Zero padding from flush(): end of stream
 			return true;
 		}
 		if (!nextStartCode(SEQUENCE_HEADER_CODE)) {
@@ -237,6 +251,7 @@ decodeSequence:
 	if (m_decodeState == DECODE_SEQUENCE) {
 		// std::cout << "SEQUENCE_HEADER_CODE" << std::endl;
 		decodeSequence();
+		skipExtensionAndUserData();
 		m_decodeState = DECODE_GROUP_OF_PICTURES;
 	}
 decodeGroupOfPictures:
@@ -244,21 +259,10 @@ decodeGroupOfPictures:
 		// std::cout << "DECODE_GROUP_OF_PICTURES" << std::endl;
 		if (nextStartCode(GROUP_START_CODE)) {
 			// TODO decode group time code
+			// 25:time_code / 1:closed_gop / 1:broken_link
 			m_bitStream.skip(27);
 
-			if (nextStartCode(EXTENSION_START_CODE)) {
-				// TODO if buffer peek(24) == 1 wont we need to pull at least 24 to get past the 1 not 8?
-				while (m_bitStream.peek(24) == 1) {
-					m_bitStream.pull(8);
-				}
-			}
-
-			if (nextStartCode(USER_START_CODE)) {
-				// TODO as per EXTENSION_START_CODE above
-				while (m_bitStream.peek(24) == 1) {
-					m_bitStream.pull(8);
-				}
-			}
+			skipExtensionAndUserData();
 
 			m_decodeState = DECODE_PICTURE;
 		} else {
@@ -295,6 +299,7 @@ decodeGroupOfPictures:
 			const auto tr = decodeFrame();
 			decodedAFrame = true;
 
+			// Temporal reference restarts in each group of pictures
 			if (tr < nextFrameIndex) {
 				forwardFrameIndex = -1;
 				nextFrameIndex = 0;
@@ -309,7 +314,7 @@ decodeGroupOfPictures:
 				}
 				nextFrameIndex++;
 			} else if (tr > nextFrameIndex) {
-				// I/P Frame
+				// I/P frame displayed after the B frames that follow it: hold it back
 				forwardFrameIndex = tr;
 				std::swap(m_ptrFrameCurrent, m_ptrFrameFuture);
 			}

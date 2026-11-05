@@ -31,7 +31,7 @@ namespace MStream {
 			return m_buffer.size();
 		}
 
-		// ************ IWriteByteStream **********
+		// ************ Producer **********
 
 		void writeByte(const DataType data) {
 			const auto writeIndex = m_writeIndex.load(std::memory_order_relaxed);
@@ -51,7 +51,7 @@ namespace MStream {
 			return temp == m_readIndex.load(std::memory_order_acquire);
 		}
 
-		// ************ IReadByteStream **********
+		// ************ Consumer **********
 
 		DataType nextByte() {
 			const auto readIndex = m_readIndex.load(std::memory_order_relaxed);
@@ -78,7 +78,7 @@ namespace MStream {
 
 		[[nodiscard]] uint32_t free() const noexcept {
 			assert(used() < size());
-			return size() - used() - 1; // need -1 so ring buffer doesn't overflow
+			return size() - used() - 1; // -1: one slot stays empty, to tell full from empty
 		}
 	};
 };

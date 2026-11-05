@@ -9,5 +9,6 @@
 #define debug_out if (false) std::cout << FILENAME_NOEXT << " - "
 #define info_out std::cout << FILENAME_NOEXT << " - "
 
+// Shifts that give 0 for a 32-bit shift, which is undefined for a uint32_t
 #define SHL(_value, _bits) ((_bits) == 32 ? 0 : ((_value) << (_bits)))
 #define SHR(_value, _bits) ((_bits) == 32 ? 0 : ((_value) >> (_bits)))

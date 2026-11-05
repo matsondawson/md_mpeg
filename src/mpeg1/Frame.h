@@ -13,7 +13,7 @@ enum VideoPictureType {
 typedef struct {
 	uint8_t run;
 	int16_t level;
-	uint8_t discard;
+	uint8_t discard; // code length in bits
 } RunLevel;
 
 

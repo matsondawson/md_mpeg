@@ -11,6 +11,10 @@
 #include "../MException.h"
 
 namespace MStream {
+	/**
+	 * Ring buffer that reports full once setSizeRequired() bytes are buffered, so the writer stops and
+	 * calls executeCallbacks(), which runs the callback when exactly that many are buffered.
+	 */
 	template<uint32_t RingBufferSize>
 	class RingBufferWithSizeEvent : public IWriteByteStream, public IReadByteStream {
 		// PTS of the latest packet, -1 if none yet
@@ -48,7 +52,6 @@ namespace MStream {
 		// ************ IWriteByteStream **********
 
 		[[nodiscard]] int32_t getPts(const int32_t frameTimeMillis) override {
-			// TODO is this class used?
 			return m_ptsMillis;
 		}
 
@@ -75,8 +78,7 @@ namespace MStream {
 			if (used() == m_sizeRequired) {
 				return true;
 			}
-			// w = 0, r = 255 -> 1 != 255 ok
-			// w = 255, r = 0 -> 
+			// One slot stays empty, to tell full from empty
 			auto temp = m_writeIndex + 1;
 			if (temp >= size()) temp = 0;
 			return temp == m_readIndex;
@@ -118,7 +120,7 @@ namespace MStream {
 
 		uint32_t free() const noexcept {
 			assert(used() < size());
-			return size() - used() - 1; // need -1 so ring buffer doesn't overflow
+			return size() - used() - 1; // -1: one slot stays empty, to tell full from empty
 		}
 
 

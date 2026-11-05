@@ -10,7 +10,9 @@ export class Uint8Buffer {
   }
 
   /**
+   * Reads the next byte into the bit buffer.
    *
+   * @return false at end of data.
    */
   nextBits(): boolean {
     if (this.byteOffset == this.data.length) return false;
@@ -20,9 +22,9 @@ export class Uint8Buffer {
   }
 
   /**
+   * Returns the next bits without consuming them.
    *
-   * @param bitCount
-   * @param padBits
+   * @param bitCount How many bits to read.
    */
   peek(bitCount: number): number {
     const _byteOffset = this.byteOffset;
@@ -32,8 +34,8 @@ export class Uint8Buffer {
     while (this.bitBufferRemaining < bitCount && this.nextBits());
     // pad bits
     if (this.bitBufferRemaining < bitCount) {
-      this.bitBufferRemaining <<= bitCount - this.bitBufferRemaining;
-      this.bitBufferRemaining += bitCount;
+      this.bitBuffer <<= bitCount - this.bitBufferRemaining;
+      this.bitBufferRemaining = bitCount;
     }
     const s = this.bitBuffer >> (this.bitBufferRemaining - bitCount);
 
@@ -45,10 +47,10 @@ export class Uint8Buffer {
   }
 
   /**
-   * skip through array.
+   * Skips bits.
    *
-   * @param bitCount How many bits to seek.
-   * @return true for more data, false for end of data.
+   * @param bitCount How many bits to skip.
+   * @throws Error at end of data.
    */
   skip(bitCount: number): void {
     while (this.bitBufferRemaining < bitCount) {

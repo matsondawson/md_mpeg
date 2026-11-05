@@ -7,7 +7,7 @@
  * Turns per-picture PTS from the video decoder into a monotonic display timeline.
  *
  * Pictures without a PTS (the stream only has to give one every so often) are placed one frame
- * period after the previous picture. A large jump is a stream discontinuity (e.g. concatenated files,
+ * period after the previous picture. A jump over 1 s is a stream discontinuity (e.g. concatenated files,
  * where PTS restart); the timeline stays continuous across it, matching the audio clock, which counts
  * samples played.
  */

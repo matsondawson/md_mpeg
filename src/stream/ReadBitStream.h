@@ -28,7 +28,9 @@ namespace MStream {
 		ReadBitStream(const ReadBitStream& cfileBuffer) = delete;
 
 		/**
-		 * Pull bitcount bits from the buffer.
+		 * Pulls bits, most significant first.
+		 * @param bitcount 1..25, or up to 32 if byte aligned
+		 * @throws EndOfData if the stream runs out
 		 */
 		uint32_t pull(const uint32_t bitcount) {
 			assert(bitcount > 0 && bitcount <= 32);
@@ -55,7 +57,7 @@ namespace MStream {
 		void push(uint32_t data, uint32_t databitcount) {
 			uint32_t available = 32 - next_data_bitcount;
 			if (available >= databitcount) {
-				// add all the data to next_word
+				// add all the data to next_data
 				next_data = SHR(next_data, databitcount) | SHL(data, 32 - databitcount);
 				next_data_bitcount += databitcount;
 				return;
@@ -64,6 +66,7 @@ namespace MStream {
 			throw std::runtime_error("Not enough space to push");
 		}
 
+		// Same limits as pull(), without consuming the bits
 		uint32_t peek(uint32_t bitcount) {
 			assert(bitcount > 0);
 			assert(bitcount <= 32);
@@ -86,6 +89,7 @@ namespace MStream {
 			next_data_bitcount = 0;
 		}
 
+		// Drops bits up to the next byte boundary, returns how many
 		uint32_t align8() {
 			const uint32_t dropped_bits = next_data_bitcount & 7;
 			//std::cout << "next_data_bitcount=" << next_data_bitcount << " dropbits=" << dropped_bits << std::endl;
@@ -103,7 +107,7 @@ namespace MStream {
 				return;
 			}
 
-			// consume remaining bits to align
+			// consume buffered bits
 			if (next_data_bitcount) {
 				next_data = SHL(next_data, next_data_bitcount);
 				bitcount -= next_data_bitcount;

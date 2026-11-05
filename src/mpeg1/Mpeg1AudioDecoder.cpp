@@ -4,6 +4,7 @@
 
 #include <cstring>
 
+// 4-byte header and the 2-byte CRC that may follow it
 #define AUDIO_HEADER_SIZE 6
 
 enum {
@@ -66,10 +67,12 @@ static const uint32_t AUDIO_BIT_RATE[] = {
     160000, 192000, 224000, 256000, 320000, 384000, 416000, 448000, // MPEG-1 V1,L1
 };
 
+// 2.0 * 2^(-i/3) in Q24, for scale factors 0..2. Each further 3 halves it.
 static constexpr int AUDIO_SCALEFACTOR_BASE[] = {
     0x02000000, 0x01965FEA, 0x01428A30
 };
 
+// Synthesis window D[] in Q15
 static constexpr float AUDIO_SYNTHESIS_WINDOW[] = {
     0.0, -0.5, -0.5, -0.5, -0.5, -0.5,
     -0.5, -1.0, -1.0, -1.0, -1.0, -1.5,
@@ -371,6 +374,7 @@ void Mpeg1AudioDecoder::decode() {
 
 /**
  * Checks a 32-bit frame header can be decoded, so corrupt data isn't mistaken for a frame.
+ * Disables audio after 3 headers of an unsupported format before any valid frame.
  */
 bool Mpeg1AudioDecoder::isValidHeader(const uint32_t header) {
     const auto sync = header >> 21;
@@ -406,7 +410,7 @@ bool Mpeg1AudioDecoder::isValidHeader(const uint32_t header) {
 }
 
 /**
- * Drops buffered data up to the next byte and goes back to looking for a frame header.
+ * Drops all buffered data and goes back to looking for a frame header.
  */
 void Mpeg1AudioDecoder::resync() {
     m_bitStream.reset();
@@ -475,6 +479,7 @@ void Mpeg1AudioDecoder::decodeHeader() {
     // TODO implement emphasis filter
     m_emphasis = m_bitStream.pull(2);
 
+    // 0 means a CRC follows. It isn't checked.
     if (!m_protectionBit) {
         m_stream.skip(2);
     }
@@ -492,7 +497,7 @@ void Mpeg1AudioDecoder::decodeHeader() {
     m_bitRate = AUDIO_BIT_RATE[m_bitRateIndex];
     m_samplingFrequency = AUDIO_SAMPLE_RATE[m_samplingFrequencyIndex];
     m_frameSize = (144 * m_bitRate / m_samplingFrequency) + paddingBit;
-    // TODO I don't know why I subtract 6/4 here
+    // Bytes left in the frame: the 4-byte header, and the 2-byte CRC if present, have been read
     m_stream.setSizeRequired(m_frameSize - (m_protectionBit ? 4 : 6));
 
     m_decoderState = DECODE_FRAME;
@@ -538,20 +543,20 @@ void Mpeg1AudioDecoder::audio_read_samples(const int ch, const int sb, const int
     // Decode samples
     int adj = q->levels;
     if (q->group) {
-        // Decode grouped sampleds
+        // Decode grouped samples
         val = m_bitStream.pull(q->bits);
         sampled[0] = val % adj;
         val /= adj;
         sampled[1] = val % adj;
         sampled[2] = val / adj;
     } else {
-        // Decode direct sampleds
+        // Decode direct samples
         sampled[0] = m_bitStream.pull(q->bits);
         sampled[1] = m_bitStream.pull(q->bits);
         sampled[2] = m_bitStream.pull(q->bits);
     }
 
-    // Postmultiply sampleds: code 0 is the most negative value, the largest valid code is (levels - 1) / levels
+    // Postmultiply samples: code 0 is the most negative value, the range is +/-(levels - 1) / levels
     // The scale is 65536 / levels with 12 fractional bits, so large level counts keep their precision
     const int32_t scale = ((1 << 28) + (adj >> 1)) / adj;
     adj = ((adj + 1) >> 1) - 1;
@@ -566,6 +571,7 @@ void Mpeg1AudioDecoder::audio_read_samples(const int ch, const int sb, const int
     sampled[2] = audioLimitSample((val * (scale_factor >> 12) + ((val * (scale_factor & 4095) + 2048) >> 12)) >> 12);
 }
 
+// 32-point matrix transform. s: subband samples, ss: sample index 0..2, d: V, dp: write position, 64 values written.
 void audio_matrix_transform(int s[32][3], int ss, audio_real_t *d, int dp) {
     audio_real_t t01, t02, t03, t04, t05, t06, t07, t08, t09, t10, t11, t12,
             t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24,
@@ -976,7 +982,7 @@ void Mpeg1AudioDecoder::decodeFrame() {
     m_bitStream.align8();
     while (!m_stream.isEmpty()) {
         const auto val = m_stream.pull(1);
-        assert(!val); // We might have padding bytes left over here
+        assert(!val); // Padding or ancillary data up to the end of the frame
     }
 
     if (m_frameCallback) {

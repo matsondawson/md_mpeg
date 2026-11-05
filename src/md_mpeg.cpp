@@ -47,7 +47,7 @@ int main(int argc, char *argv[]) {
 	clock.setAudioSource([&] { return sdl.audioClockMs(); });
 
 	DisplayTimestamper displayTimestamper;
-	// ~0.5-1s of video, enough to cover how far ahead of audio the video is muxed
+	// 0.4-1 s of video at 24-60 fps, enough to cover how far ahead of audio the video is muxed
 	VideoFrameQueue frameQueue(24);
 
 	// User requests. Seek and quit are carried out by the main loop, outside any decoder call.
@@ -153,7 +153,7 @@ int main(int argc, char *argv[]) {
 			}
 			const int64_t ptsMs = displayTimestamper.next(frame.m_ptsMillis, videoDecoder.m_frame_period_millis);
 			if (ptsMs < 0) {
-				return; // No timing yet (just after a seek)
+				return; // No timing yet: no PTS since the start or a seek
 			}
 
 			// Queue full: keep presenting until there is room

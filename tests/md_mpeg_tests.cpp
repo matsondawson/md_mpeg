@@ -13,6 +13,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -318,6 +319,66 @@ static void testAudioAccuracy() {
 	checkAudioMatchesFfmpeg(stereo, "stereo.pcm", 2);
 }
 
+// Extension and user data after sequence, group and picture headers must be skipped, without being reported as
+// corruption. Fed straight to the video decoder, as this needs an elementary stream edited at start codes.
+static void testExtensionAndUserData() {
+	const auto path = media("video.m1v");
+	if (!fs::exists(path)) {
+		run("ffmpeg -nostdin -y " + VIDEO_320 + " -t 2 -c:v mpeg1video -bf 2 -g 12 -f mpeg1video \"" + path.string() + "\"");
+	}
+	const auto stream = readFile(path);
+
+	const std::vector<uint8_t> extra = {
+		0, 0, 1, 0xB5, 'e', 'x', 't', 0xFF,
+		0, 0, 1, 0xB2, 'u', 's', 'e', 'r', 0xFF,
+	};
+	std::vector<uint8_t> edited;
+	int inserted = 0;
+	bool pictureHeader = false;
+	bool sequenceHeader = false;
+	for (size_t i = 0; i < stream.size(); i++) {
+		const bool startCode = i + 3 < stream.size() && stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1;
+		if (startCode && sequenceHeader) {
+			// The sequence header ends at the next start code
+			sequenceHeader = false;
+			edited.insert(edited.end(), extra.begin(), extra.end());
+			inserted++;
+		}
+		if (startCode && stream[i + 3] == 0xB3) {
+			sequenceHeader = true;
+		} else if (startCode && stream[i + 3] == 0x00) {
+			pictureHeader = true;
+		} else if (startCode && stream[i + 3] == 0x01 && pictureHeader) {
+			// First slice of a picture
+			pictureHeader = false;
+			edited.insert(edited.end(), extra.begin(), extra.end());
+			inserted++;
+		} else if (startCode && stream[i + 3] == 0xB8) {
+			// The group header is 4 bytes after its start code
+			edited.insert(edited.end(), stream.begin() + static_cast<std::ptrdiff_t>(i), stream.begin() + static_cast<std::ptrdiff_t>(i + 8));
+			edited.insert(edited.end(), extra.begin(), extra.end());
+			inserted++;
+			i += 7;
+			continue;
+		}
+		edited.push_back(stream[i]);
+	}
+	CHECK(inserted > 50);
+
+	const auto video = std::make_unique<Mpeg1VideoDecoder>();
+	int frames = 0;
+	video->setFrameCallback([&frames](const Frame &) { frames++; });
+	std::ostringstream log;
+	auto *const coutBuffer = std::cout.rdbuf(log.rdbuf());
+	for (const auto byte : edited) {
+		video->writeByte(byte);
+	}
+	video->flush();
+	std::cout.rdbuf(coutBuffer);
+	CHECK(frames == 50);
+	CHECK(log.str().empty());
+}
+
 // Only MP2 is supported; other audio is ignored rather than decoded as noise
 static void testUnsupportedAudio() {
 	const auto clip = generate("mp3audio.mpg", VIDEO_320 + " " + TONE + " -t 2 -c:v mpeg1video -c:a libmp3lame");
@@ -409,6 +470,7 @@ int main(int argc, char *argv[]) {
 		{"odd size", testOddSize},
 		{"audio only", testAudioOnly},
 		{"video only", testVideoOnly},
+		{"extension and user data", testExtensionAndUserData},
 		{"audio accuracy", testAudioAccuracy},
 		{"unsupported audio", testUnsupportedAudio},
 		{"truncated", testTruncated},

@@ -62,7 +62,9 @@ public:
 
 	FrameSize m_frameSize;
 
+	// Temporal reference of the next picture to display
 	uint32_t nextFrameIndex = 0;
+	// Temporal reference of the anchor frame held back for display, -1 if none
 	uint32_t forwardFrameIndex = -1;
 
 	// private:
@@ -89,7 +91,7 @@ private:
 
 	// slice processing
 	uint32_t mb_row, mb_col;
-	// These really 18bit values, 32 next closest
+	// Coefficients are 18 bits: 12-bit level, 6-bit premultiplier
 	int32_t block_data[64]{ 0 };
 
 public:
@@ -99,8 +101,11 @@ public:
 	int32_t dc_predictor[3];
 
 public:
+	// Reference for forward motion vectors
 	Frame* m_ptrFramePast;
+	// Being decoded
 	Frame* m_ptrFrameCurrent;
+	// Reference for backward motion vectors
 	Frame* m_ptrFrameFuture;
 	Frame* m_ptrRenderFrame;
 
@@ -126,11 +131,15 @@ public:
 	void setFrameCallback(const std::function<void(const Frame &frame)> &frameCallback);
 
 	void decodeSequence();
+	// Skips any extension data, then any user data, each up to the next start code
+	void skipExtensionAndUserData();
 
 	void generateRgbFrameData(uint32_t *rgbData, const Frame &frame) const;
 
 	// Frame
+	// Decodes one picture, returns its temporal reference
 	uint32_t decodeFrame();
+	// Advances to and decodes the next picture, returns true if one was decoded or the stream ended
 	bool decodeFrame2();
 	// Decodes, recovering from corrupt data by skipping to the next picture
 	void decodeOrResync();
@@ -138,8 +147,11 @@ public:
 	// Discards all buffered data and decoding state, e.g. after seeking. Waits for the next I-frame.
 	void reset();
 
+	// slice: low byte of the slice start code, the 1-based macroblock row
 	void processSlice(uint32_t slice);
+	// slice_begin: first macroblock of the slice, whose address increment is relative to the row start
 	void processMacroblock(bool slice_begin);
+	// i: coded block pattern, bit 5 is block 0, bit 0 is block 5
 	void decodeBlock(uint32_t i);
 	uint32_t decodeDCTDCSizeLuminance();
 	int decodeDCTDCSizeChrominance();
@@ -147,11 +159,15 @@ public:
 	RunLevel decodeDCTCoeff(bool first);
 	uint32_t decodeCodedBlockPattern();
 	void decodeMacroblockType();
+	// Reads a motion code and returns motion with it applied, wrapped to the range r_size allows
 	int32_t updateMotionVector(int32_t r_size, int32_t motion);
 	void decodeMotionVectors();
 	void predictMacroblock() const;
+	// Predicts the current macroblock from frame d. motion_h and motion_v are luma half pels.
 	void videoCopyMacroblock(int motion_h, int motion_v, const Frame* d) const;
+	// Same, averaging with what is already in the current macroblock
 	void videoInterpolateMacroblock(int motion_h, int motion_v, const Frame* d) const;
+	// One plane of the above: d is the destination plane, s the source plane, block_size 16 for luma, 8 for chroma
 	void videoProcessMacroblock(uint8_t* d, const uint8_t* s, int motion_h, int motion_v, uint32_t block_size) const;
 	void videoProcessMacroblockInterpolate(uint8_t* d, const uint8_t* s, int motion_h, int motion_v, uint32_t block_size) const;
 };

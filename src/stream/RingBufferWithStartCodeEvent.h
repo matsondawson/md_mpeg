@@ -11,6 +11,13 @@
 #include <cassert>
 
 namespace MStream {
+	/**
+	 * Ring buffer that can scan for a 4-byte start code as it is written.
+	 *
+	 * With scanForCode set, writeByte() runs the callback each time the code is written and at least two
+	 * are unread. Two picture start codes mean one complete picture is buffered.
+	 * With the default of 0xFFFFFFFF nothing is scanned, and there must be no callback.
+	 */
 	template <uint32_t RingBufferSize, uint32_t scanForCode = 0xFFFFFFFF>
 	class RingBufferWithStartCodeEvent final : public IWriteByteStream, public IReadByteStream {
 
@@ -44,12 +51,6 @@ namespace MStream {
 			assert((scanForCode == 0xFFFFFFFF) != !!scanCodeMatchCallback);
 		}
 
-		/* The way the decoder works is it fills the ring buffer with packets until it has at least one frame,
-		 * then it calls the scanCodeMatchCallback which decodes the frame/audio.
-		 * It knows it has one frames worth of data when it has encountered two frame start codes.
-		 * i.e. start of frame 0 -> start of frame 1
-		 * It checks the scan code count once after every completed packet.
-		 */
 		[[nodiscard]] uint32_t size() const noexcept {
 			return m_buffer.size();
 		}
@@ -126,8 +127,7 @@ namespace MStream {
 					m_scanCodeMatchCallback();
 				}
 			}*/
-			// w = 0, r = 255 -> 1 != 255 ok
-			// w = 255, r = 0 -> 
+			// One slot stays empty, to tell full from empty
 			auto temp = m_writeIndex + 1;
 			if (temp >= size()) temp = 0;
 			return temp == m_readIndex;
@@ -158,7 +158,7 @@ namespace MStream {
 
 			if (scanForCode != 0XFFFFFFFF) {
 				m_scanCodeReadMatchValue = (m_scanCodeReadMatchValue << 8) | result;
-				// event callback
+				// Read past a scan code: make its PTS current
 				if (m_scanCodeReadMatchValue == scanForCode) {
 					m_scanCodeMatchCount--;
 					if (!m_scanCodePts.empty()) {
@@ -177,6 +177,7 @@ namespace MStream {
 
 		// ================ MARK ================
 
+		// Remembers the read position for reset()
 		void mark() noexcept {
 			assert(m_markIndex == -1);
 			m_markIndex = m_readIndex;
@@ -195,6 +196,7 @@ namespace MStream {
 			m_markIndex = -1;
 		}
 
+		// Rewinds to the position saved by mark()
 		void reset() noexcept {
 			assert(m_markIndex != -1);
 			m_readIndex = m_markIndex;
@@ -207,7 +209,7 @@ namespace MStream {
 
 		[[nodiscard]] uint32_t free() const noexcept {
 			assert(used() < size());
-			return size() - used() - 1; // need -1 so ring buffer doesn't overflow
+			return size() - used() - 1; // -1: one slot stays empty, to tell full from empty
 		}
 
 
