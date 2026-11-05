@@ -173,7 +173,7 @@ int main(int argc, char *argv[]) {
 		});
 
 	audioDecoder.setFrameCallback(
-		[&](const uint32_t frequency, const uint32_t channels, MStream::RingBufferTyped<float, 32768> *soundBuffer) {
+		[&](const uint32_t frequency, const uint32_t channels, AudioSampleBuffer *soundBuffer) {
 			if (!audioInited) {
 				audioInited = true;
 				sdl.initAudio(frequency, channels, soundBuffer);

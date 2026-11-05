@@ -96,38 +96,39 @@ uint32_t *ScreenContextRgbSDL::rgbData() const {
 }
 
 /**
- * @return bytesFilled sizeof(float) * channels *
+ * @return bytesFilled sizeof(AudioSample) * channels *
  */
 int32_t sdl2_audio_callback(void *userdata, uint8_t *stream, int byteLength) {
 	int32_t bytesFilled = 0;
 	const auto sdlContext = static_cast<ScreenContextRgbSDL *>(userdata);
 	const auto soundBuffer = sdlContext->m_soundBuffer;
-	auto floatStreamLeft = reinterpret_cast<float *>(stream);
+	auto sampleStreamLeft = reinterpret_cast<AudioSample *>(stream);
+	constexpr int blockBytes = 32 * 2 * sizeof(AudioSample);
 	if (sdlContext->m_wav_spec.channels == 2) {
-		// Sound buffer must have 64 floats, which is 32 floats for left channel and 32 for right
-		// Buffer must be able to accept 64 floats
-		while (byteLength >= 32 * 2 * 4 && soundBuffer->used() >= 64) {
+		// Sound buffer must have 64 samples, which is 32 samples for left channel and 32 for right
+		// Buffer must be able to accept 64 samples
+		while (byteLength >= blockBytes && soundBuffer->used() >= 64) {
 			// We read from channel blocks Left x 32,Right x 32,etc...
 			// And write to interleaved channels LRLRLRLR
 			// Left channel
-			auto floatStreamRight = floatStreamLeft + 1;
+			auto sampleStreamRight = sampleStreamLeft + 1;
 			for (int i = 0; i < 32; i++) {
-				*floatStreamLeft = soundBuffer->nextByte();
-				floatStreamLeft += 2;
+				*sampleStreamLeft = soundBuffer->nextByte();
+				sampleStreamLeft += 2;
 			}
 			// Right channel
 			for (int i = 0; i < 32; i++) {
-				*floatStreamRight = soundBuffer->nextByte();
-				floatStreamRight += 2;
+				*sampleStreamRight = soundBuffer->nextByte();
+				sampleStreamRight += 2;
 			}
-			byteLength -= 8 * 32;
-			bytesFilled += 8 * 32;
+			byteLength -= blockBytes;
+			bytesFilled += blockBytes;
 		}
 	} else if (sdlContext->m_wav_spec.channels == 1) {
-		while (byteLength > 0 && soundBuffer->used()) {
-			*(floatStreamLeft++) = soundBuffer->nextByte();
-			byteLength -= 4;
-			bytesFilled += 4;
+		while (byteLength >= static_cast<int>(sizeof(AudioSample)) && soundBuffer->used()) {
+			*(sampleStreamLeft++) = soundBuffer->nextByte();
+			byteLength -= sizeof(AudioSample);
+			bytesFilled += sizeof(AudioSample);
 		}
 	}
 	// else do nothing
@@ -149,7 +150,7 @@ void SDLCALL my_audio_callback(void *userdata, SDL_AudioStream *stream, const in
 
 	// Record playback position for the audio clock
 	const auto sdlContext = static_cast<ScreenContextRgbSDL *>(userdata);
-	const auto frames = static_cast<uint64_t>(bytesFilled) / (sizeof(float) * sdlContext->m_wav_spec.channels);
+	const auto frames = static_cast<uint64_t>(bytesFilled) / (sizeof(AudioSample) * sdlContext->m_wav_spec.channels);
 	std::lock_guard lock(sdlContext->m_audioPositionMutex);
 	sdlContext->m_framesBeforeLastCallback = sdlContext->m_framesAfterLastCallback;
 	sdlContext->m_framesAfterLastCallback += frames;
@@ -157,7 +158,7 @@ void SDLCALL my_audio_callback(void *userdata, SDL_AudioStream *stream, const in
 }
 
 void ScreenContextRgbSDL::initAudio(const uint32_t frequencyHz, const uint32_t channels,
-                                    MStream::RingBufferTyped<float, 32768> *soundBuffer) {
+                                    AudioSampleBuffer *soundBuffer) {
 	if (channels > 2) {
 		cthrow(StringException, "Invalid number of channels, got " << channels << " channels");
 	}
@@ -167,7 +168,7 @@ void ScreenContextRgbSDL::initAudio(const uint32_t frequencyHz, const uint32_t c
 	}
 	m_soundBuffer = soundBuffer;
 	m_wav_spec.freq = static_cast<int>(frequencyHz);
-	m_wav_spec.format = SDL_AUDIO_F32LE;
+	m_wav_spec.format = MD_MPEG_AUDIO_FIXED_POINT ? SDL_AUDIO_S16 : SDL_AUDIO_F32;
 	m_wav_spec.channels = static_cast<int>(channels);
 
 	// Device starts paused

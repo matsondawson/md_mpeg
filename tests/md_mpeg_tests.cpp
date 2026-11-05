@@ -3,6 +3,7 @@
 //
 // Usage: md_mpeg_tests <directory for generated media>
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -97,8 +98,9 @@ struct Pipeline {
 	uint32_t width = 0, height = 0;
 	std::vector<uint32_t> firstFrameRgb;
 
-	uint64_t audioValues = 0; // floats decoded (samples x channels)
+	uint64_t audioValues = 0; // sample values decoded (samples x channels)
 	uint32_t audioFrequency = 0, audioChannels = 0;
+	std::vector<AudioSample> audioSamples; // in decoder order: stereo is 32 left, 32 right, ...
 
 	bool finished = false;
 	bool threw = false;
@@ -125,12 +127,12 @@ struct Pipeline {
 			}
 		});
 		audio.setFrameCallback([this](const uint32_t frequency, const uint32_t channels,
-		                              MStream::RingBufferTyped<float, 32768> *soundBuffer) {
+		                              AudioSampleBuffer *soundBuffer) {
 			audioFrequency = frequency;
 			audioChannels = channels;
 			// Play it all instantly
 			while (!soundBuffer->isEmpty()) {
-				soundBuffer->nextByte();
+				audioSamples.push_back(soundBuffer->nextByte());
 				audioValues++;
 			}
 		});
@@ -270,6 +272,52 @@ static void testVideoOnly() {
 	CHECK(p->audioValues == 0);
 }
 
+// The decoded waveform, including its level and polarity, must match ffmpeg's decode
+static constexpr double MIN_SNR_DB = 55.0;
+
+static void checkAudioMatchesFfmpeg(const fs::path &clip, const std::string &referenceName, const uint32_t channels) {
+	const auto reference = media(referenceName);
+	if (!fs::exists(reference)) {
+		run("ffmpeg -nostdin -y -i \"" + clip.string() + "\" -vn -f s16le -acodec pcm_s16le \"" + reference.string() + "\"");
+	}
+	const auto bytes = readFile(reference);
+	const auto p = decode(clip);
+	CHECK(p->finished);
+	CHECK(p->audioChannels == channels);
+	CHECK(bytes.size() >= 2);
+
+	// Interleave to match the reference
+	const size_t count = std::min(p->audioSamples.size() - p->audioSamples.size() % 64, bytes.size() / 2);
+	CHECK_RANGE(static_cast<double>(count) / static_cast<double>(bytes.size() / 2), 0.99, 1.01);
+	const double toS16 = MD_MPEG_AUDIO_FIXED_POINT ? 1.0 : 32768.0;
+	double sumReference = 0, sumError = 0;
+	for (size_t i = 0; i < count; i++) {
+		size_t decodedIndex = i;
+		if (channels == 2) {
+			const size_t frame = i / 2;
+			decodedIndex = frame / 32 * 64 + (i & 1) * 32 + frame % 32;
+		}
+		const double decoded = p->audioSamples[decodedIndex] * toS16;
+		const double expected = static_cast<int16_t>(bytes[i * 2] | (bytes[i * 2 + 1] << 8));
+		sumReference += expected * expected;
+		sumError += (decoded - expected) * (decoded - expected);
+	}
+	CHECK(sumReference > 0);
+	if (sumReference > 0) {
+		const double snrDb = sumError > 0 ? 10.0 * std::log10(sumReference / sumError) : 200.0;
+		std::cout << "  " << referenceName << ": " << snrDb << " dB from ffmpeg" << std::endl;
+		CHECK(snrDb >= MIN_SNR_DB);
+	}
+}
+
+static void testAudioAccuracy() {
+	checkAudioMatchesFfmpeg(generate("tone.mpg", TONE + " -t 3 -c:a mp2"), "tone.pcm", 1);
+	// Loud and wide-band, stereo: harder on the synthesis filter's range and precision
+	const auto stereo = generate("stereo.mpg", "-f lavfi -i \"aevalsrc=0.9*sin(2*PI*(200+2000*t)*t)|0.9*random(0)-0.45:s=48000\""
+	                                           " -t 3 -c:a mp2 -b:a 384k");
+	checkAudioMatchesFfmpeg(stereo, "stereo.pcm", 2);
+}
+
 // Only MP2 is supported; other audio is ignored rather than decoded as noise
 static void testUnsupportedAudio() {
 	const auto clip = generate("mp3audio.mpg", VIDEO_320 + " " + TONE + " -t 2 -c:v mpeg1video -c:a libmp3lame");
@@ -361,6 +409,7 @@ int main(int argc, char *argv[]) {
 		{"odd size", testOddSize},
 		{"audio only", testAudioOnly},
 		{"video only", testVideoOnly},
+		{"audio accuracy", testAudioAccuracy},
 		{"unsupported audio", testUnsupportedAudio},
 		{"truncated", testTruncated},
 		{"corrupt", testCorrupt},

@@ -12,6 +12,8 @@ set(MD_MPEG_COMPILE_OPTIONS
 	$<$<CONFIG:Debug>:-O0>
 )
 
+option(MD_MPEG_AUDIO_FIXED_POINT "Decode audio with 32-bit integer arithmetic and output 16-bit samples" ON)
+
 # Demuxing and decoding, no SDL dependency. Shared by the player and the tests.
 add_library(md_mpeg_core STATIC
 	"src/Time.cpp"
@@ -26,6 +28,7 @@ target_include_directories(md_mpeg_core PUBLIC
 	"${CMAKE_SOURCE_DIR}/src/mpeg1"
 )
 target_compile_options(md_mpeg_core PRIVATE ${MD_MPEG_COMPILE_OPTIONS})
+target_compile_definitions(md_mpeg_core PUBLIC MD_MPEG_AUDIO_FIXED_POINT=$<BOOL:${MD_MPEG_AUDIO_FIXED_POINT}>)
 
 # Player
 find_package(SDL3 REQUIRED)

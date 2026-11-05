@@ -12,7 +12,7 @@ enum {
 } AUDIO_STATE;
 
 void Mpeg1AudioDecoder::setFrameCallback(const std::function<void(const uint32_t frequency, const uint32_t channels,
-                                                                  MStream::RingBufferTyped<float, 32768> *soundBuffer)>
+                                                                  AudioSampleBuffer *soundBuffer)>
     &frameCallback) {
     m_frameCallback = frameCallback;
 }
@@ -70,7 +70,7 @@ static constexpr int AUDIO_SCALEFACTOR_BASE[] = {
     0x02000000, 0x01965FEA, 0x01428A30
 };
 
-static const float AUDIO_SYNTHESIS_WINDOW[] = {
+static constexpr float AUDIO_SYNTHESIS_WINDOW[] = {
     0.0, -0.5, -0.5, -0.5, -0.5, -0.5,
     -0.5, -1.0, -1.0, -1.0, -1.0, -1.5,
     -1.5, -2.0, -2.0, -2.5, -2.5, -3.0,
@@ -158,6 +158,97 @@ static const float AUDIO_SYNTHESIS_WINDOW[] = {
     1.0, 1.0, 0.5, 0.5, 0.5, 0.5,
     0.5, 0.5,
 };
+
+#if MD_MPEG_AUDIO_FIXED_POINT
+
+// Fixed point arithmetic, using nothing wider than 32 bits.
+//
+// A decoded subband sample has 15 fractional bits. Inside the synthesis filter it gets AUDIO_GUARD_BITS more,
+// so rounding errors stay below the 16-bit output's LSB. 4 is the most that can't overflow for any input,
+// including corrupt frames: samples are limited to +/-65536 (see audioLimitSample), which the matrix transform
+// grows to at most 2^24 before guard bits. The window sum multiplies that by at most 2.73 (the largest sum of
+// a window's 16 taps), and each tap's first product (see audioWindowMul) needs
+// 2^(24 + guard - 14) * 75038 < 2^31.
+static constexpr int AUDIO_GUARD_BITS = 4;
+
+// +/-65536 is the most a valid code can reach (1.0 at the largest scale factor, 2.0). Only invalid codes in
+// corrupt frames go past it.
+static inline int32_t audioLimitSample(const int32_t value) {
+    return value > 65536 ? 65536 : value < -65536 ? -65536 : value;
+}
+
+// Q16, always positive. Precise to about -96 dB, the limit of 16-bit output.
+static constexpr int32_t audioCosQ16(const float coefficient) {
+    return static_cast<int32_t>(static_cast<double>(coefficient) * 65536.0 + 0.5);
+}
+
+// Returns round(a * c / 65536). The partial products are split so that each one fits in 32 bits.
+template <int32_t c>
+static inline int32_t audioCosMul(const int32_t a) {
+    constexpr int32_t cHigh = c >> 16;
+    constexpr uint32_t cLow = static_cast<uint32_t>(c) & 0xFFFF;
+    const uint32_t aLow = static_cast<uint32_t>(a) & 0xFFFF;
+    return (a >> 16) * c + static_cast<int32_t>(aLow) * cHigh + static_cast<int32_t>((aLow * cLow + 0x8000) >> 16);
+}
+
+#define AUDIO_COS_MUL(value, coefficient) audioCosMul<audioCosQ16(coefficient)>(value)
+
+static inline audio_real_t audioSubband(const int32_t value) {
+    return value * (1 << AUDIO_GUARD_BITS);
+}
+
+// The window in Q16. Its values are all multiples of 0.5 in Q15, so this is exact and at most 17 bits + sign.
+// Only computed at compile time, the float table isn't in the binary.
+struct AudioWindowQ16 {
+    int32_t values[512];
+};
+
+static constexpr AudioWindowQ16 audioMakeWindowQ16() {
+    static_assert(sizeof(AUDIO_SYNTHESIS_WINDOW) / sizeof(AUDIO_SYNTHESIS_WINDOW[0]) == 512);
+    AudioWindowQ16 window{};
+    for (int i = 0; i < 512; i++) {
+        window.values[i] = static_cast<int32_t>(AUDIO_SYNTHESIS_WINDOW[i] * 2.0f);
+    }
+    return window;
+}
+
+static constexpr AudioWindowQ16 AUDIO_SYNTHESIS_WINDOW_Q16 = audioMakeWindowQ16();
+
+// Returns round(v * window / 65536), so the sum keeps v's format. Splitting v at bit 14 keeps both products in
+// 32 bits: the low one is under 2^14 * 2^17, the bound on the high one is explained at AUDIO_GUARD_BITS.
+static inline audio_real_t audioWindowMul(const int index, const audio_real_t v) {
+    const int32_t window = AUDIO_SYNTHESIS_WINDOW_Q16.values[index];
+    return ((v >> 14) * window + (((v & 0x3FFF) * window) >> 14) + 2) >> 2;
+}
+
+// The sum has 15 + AUDIO_GUARD_BITS fractional bits, so 1.0 is 32768 and full scale peaks can clip
+static inline AudioSample audioOutputSample(const audio_real_t value) {
+    const int32_t rounded = (value + (1 << (AUDIO_GUARD_BITS - 1))) >> AUDIO_GUARD_BITS;
+    return static_cast<AudioSample>(rounded > 32767 ? 32767 : rounded < -32768 ? -32768 : rounded);
+}
+
+#else
+
+#define AUDIO_COS_MUL(value, coefficient) ((value) * (coefficient))
+
+static inline int32_t audioLimitSample(const int32_t value) {
+    return value;
+}
+
+static inline audio_real_t audioSubband(const int32_t value) {
+    return static_cast<float>(value);
+}
+
+static inline audio_real_t audioWindowMul(const int index, const audio_real_t v) {
+    return AUDIO_SYNTHESIS_WINDOW[index] * v;
+}
+
+static inline AudioSample audioOutputSample(const audio_real_t value) {
+    // The sum has 30 fractional bits: 15 from the sample, 15 from the window
+    return value / 1073741824.0f;
+}
+
+#endif
 
 // Quantizer lookup, step 1: bitrate classes
 static const uint8_t AUDIO_QUANT_LUT_STEP_1[2][16] = {
@@ -460,128 +551,129 @@ void Mpeg1AudioDecoder::audio_read_samples(const int ch, const int sb, const int
         sampled[2] = m_bitStream.pull(q->bits);
     }
 
-    // Postmultiply sampleds
-    const int32_t scale = 65536 / (adj + 1);
+    // Postmultiply sampleds: code 0 is the most negative value, the largest valid code is (levels - 1) / levels
+    // The scale is 65536 / levels with 12 fractional bits, so large level counts keep their precision
+    const int32_t scale = ((1 << 28) + (adj >> 1)) / adj;
     adj = ((adj + 1) >> 1) - 1;
 
-    val = (adj - sampled[0]) * scale;
-    sampled[0] = (val * (scale_factor >> 12) + ((val * (scale_factor & 4095) + 2048) >> 12)) >> 12;
+    val = ((sampled[0] - adj) * scale + 2048) >> 12;
+    sampled[0] = audioLimitSample((val * (scale_factor >> 12) + ((val * (scale_factor & 4095) + 2048) >> 12)) >> 12);
 
-    val = (adj - sampled[1]) * scale;
-    sampled[1] = (val * (scale_factor >> 12) + ((val * (scale_factor & 4095) + 2048) >> 12)) >> 12;
+    val = ((sampled[1] - adj) * scale + 2048) >> 12;
+    sampled[1] = audioLimitSample((val * (scale_factor >> 12) + ((val * (scale_factor & 4095) + 2048) >> 12)) >> 12);
 
-    val = (adj - sampled[2]) * scale;
-    sampled[2] = (val * (scale_factor >> 12) + ((val * (scale_factor & 4095) + 2048) >> 12)) >> 12;
+    val = ((sampled[2] - adj) * scale + 2048) >> 12;
+    sampled[2] = audioLimitSample((val * (scale_factor >> 12) + ((val * (scale_factor & 4095) + 2048) >> 12)) >> 12);
 }
 
-void audio_matrix_transform(int s[32][3], int ss, float *d, int dp) {
-    float t01, t02, t03, t04, t05, t06, t07, t08, t09, t10, t11, t12,
+void audio_matrix_transform(int s[32][3], int ss, audio_real_t *d, int dp) {
+    audio_real_t t01, t02, t03, t04, t05, t06, t07, t08, t09, t10, t11, t12,
             t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24,
             t25, t26, t27, t28, t29, t30, t31, t32, t33;
 
-    t01 = static_cast<float>(s[0][ss] + s[31][ss]);
-    t02 = static_cast<float>(s[0][ss] - s[31][ss]) * 0.500602998235f;
-    t03 = static_cast<float>(s[1][ss] + s[30][ss]);
-    t04 = static_cast<float>(s[1][ss] - s[30][ss]) * 0.505470959898f;
-    t05 = static_cast<float>(s[2][ss] + s[29][ss]);
-    t06 = static_cast<float>(s[2][ss] - s[29][ss]) * 0.515447309923f;
-    t07 = static_cast<float>(s[3][ss] + s[28][ss]);
-    t08 = static_cast<float>(s[3][ss] - s[28][ss]) * 0.53104259109f;
-    t09 = static_cast<float>(s[4][ss] + s[27][ss]);
-    t10 = static_cast<float>(s[4][ss] - s[27][ss]) * 0.553103896034f;
-    t11 = static_cast<float>(s[5][ss] + s[26][ss]);
-    t12 = static_cast<float>(s[5][ss] - s[26][ss]) * 0.582934968206f;
-    t13 = static_cast<float>(s[6][ss] + s[25][ss]);
-    t14 = static_cast<float>(s[6][ss] - s[25][ss]) * 0.622504123036f;
-    t15 = static_cast<float>(s[7][ss] + s[24][ss]);
-    t16 = static_cast<float>(s[7][ss] - s[24][ss]) * 0.674808341455f;
-    t17 = static_cast<float>(s[8][ss] + s[23][ss]);
-    t18 = static_cast<float>(s[8][ss] - s[23][ss]) * 0.744536271002f;
-    t19 = static_cast<float>(s[9][ss] + s[22][ss]);
-    t20 = static_cast<float>(s[9][ss] - s[22][ss]) * 0.839349645416f;
-    t21 = static_cast<float>(s[10][ss] + s[21][ss]);
-    t22 = static_cast<float>(s[10][ss] - s[21][ss]) * 0.972568237862f;
-    t23 = static_cast<float>(s[11][ss] + s[20][ss]);
-    t24 = static_cast<float>(s[11][ss] - s[20][ss]) * 1.16943993343f;
-    t25 = static_cast<float>(s[12][ss] + s[19][ss]);
-    t26 = static_cast<float>(s[12][ss] - s[19][ss]) * 1.48416461631f;
-    t27 = static_cast<float>(s[13][ss] + s[18][ss]);
-    t28 = static_cast<float>(s[13][ss] - s[18][ss]) * 2.05778100995f;
-    t29 = static_cast<float>(s[14][ss] + s[17][ss]);
-    t30 = static_cast<float>(s[14][ss] - s[17][ss]) * 3.40760841847f;
-    t31 = static_cast<float>(s[15][ss] + s[16][ss]);
-    t32 = static_cast<float>(s[15][ss] - s[16][ss]) * 10.1900081235f;
+    t01 = audioSubband(s[0][ss] + s[31][ss]);
+    t02 = AUDIO_COS_MUL(audioSubband(s[0][ss] - s[31][ss]), 0.500602998235f);
+    t03 = audioSubband(s[1][ss] + s[30][ss]);
+    t04 = AUDIO_COS_MUL(audioSubband(s[1][ss] - s[30][ss]), 0.505470959898f);
+    t05 = audioSubband(s[2][ss] + s[29][ss]);
+    t06 = AUDIO_COS_MUL(audioSubband(s[2][ss] - s[29][ss]), 0.515447309923f);
+    t07 = audioSubband(s[3][ss] + s[28][ss]);
+    t08 = AUDIO_COS_MUL(audioSubband(s[3][ss] - s[28][ss]), 0.53104259109f);
+    t09 = audioSubband(s[4][ss] + s[27][ss]);
+    t10 = AUDIO_COS_MUL(audioSubband(s[4][ss] - s[27][ss]), 0.553103896034f);
+    t11 = audioSubband(s[5][ss] + s[26][ss]);
+    t12 = AUDIO_COS_MUL(audioSubband(s[5][ss] - s[26][ss]), 0.582934968206f);
+    t13 = audioSubband(s[6][ss] + s[25][ss]);
+    t14 = AUDIO_COS_MUL(audioSubband(s[6][ss] - s[25][ss]), 0.622504123036f);
+    t15 = audioSubband(s[7][ss] + s[24][ss]);
+    t16 = AUDIO_COS_MUL(audioSubband(s[7][ss] - s[24][ss]), 0.674808341455f);
+    t17 = audioSubband(s[8][ss] + s[23][ss]);
+    t18 = AUDIO_COS_MUL(audioSubband(s[8][ss] - s[23][ss]), 0.744536271002f);
+    t19 = audioSubband(s[9][ss] + s[22][ss]);
+    t20 = AUDIO_COS_MUL(audioSubband(s[9][ss] - s[22][ss]), 0.839349645416f);
+    t21 = audioSubband(s[10][ss] + s[21][ss]);
+    t22 = AUDIO_COS_MUL(audioSubband(s[10][ss] - s[21][ss]), 0.972568237862f);
+    t23 = audioSubband(s[11][ss] + s[20][ss]);
+    t24 = AUDIO_COS_MUL(audioSubband(s[11][ss] - s[20][ss]), 1.16943993343f);
+    t25 = audioSubband(s[12][ss] + s[19][ss]);
+    t26 = AUDIO_COS_MUL(audioSubband(s[12][ss] - s[19][ss]), 1.48416461631f);
+    t27 = audioSubband(s[13][ss] + s[18][ss]);
+    t28 = AUDIO_COS_MUL(audioSubband(s[13][ss] - s[18][ss]), 2.05778100995f);
+    t29 = audioSubband(s[14][ss] + s[17][ss]);
+    t30 = AUDIO_COS_MUL(audioSubband(s[14][ss] - s[17][ss]), 3.40760841847f);
+    t31 = audioSubband(s[15][ss] + s[16][ss]);
+    t32 = AUDIO_COS_MUL(audioSubband(s[15][ss] - s[16][ss]), 10.1900081235f);
 
     t33 = t01 + t31;
-    t31 = (t01 - t31) * 0.502419286188f;
+    t31 = AUDIO_COS_MUL(t01 - t31, 0.502419286188f);
     t01 = t03 + t29;
-    t29 = (t03 - t29) * 0.52249861494f;
+    t29 = AUDIO_COS_MUL(t03 - t29, 0.52249861494f);
     t03 = t05 + t27;
-    t27 = (t05 - t27) * 0.566944034816f;
+    t27 = AUDIO_COS_MUL(t05 - t27, 0.566944034816f);
     t05 = t07 + t25;
-    t25 = (t07 - t25) * 0.64682178336f;
+    t25 = AUDIO_COS_MUL(t07 - t25, 0.64682178336f);
     t07 = t09 + t23;
-    t23 = (t09 - t23) * 0.788154623451f;
+    t23 = AUDIO_COS_MUL(t09 - t23, 0.788154623451f);
     t09 = t11 + t21;
-    t21 = (t11 - t21) * 1.06067768599f;
+    t21 = AUDIO_COS_MUL(t11 - t21, 1.06067768599f);
     t11 = t13 + t19;
-    t19 = (t13 - t19) * 1.72244709824f;
+    t19 = AUDIO_COS_MUL(t13 - t19, 1.72244709824f);
     t13 = t15 + t17;
-    t17 = (t15 - t17) * 5.10114861869f;
+    t17 = AUDIO_COS_MUL(t15 - t17, 5.10114861869f);
     t15 = t33 + t13;
-    t13 = (t33 - t13) * 0.509795579104f;
+    t13 = AUDIO_COS_MUL(t33 - t13, 0.509795579104f);
     t33 = t01 + t11;
-    t01 = (t01 - t11) * 0.601344886935f;
+    t01 = AUDIO_COS_MUL(t01 - t11, 0.601344886935f);
     t11 = t03 + t09;
-    t09 = (t03 - t09) * 0.899976223136f;
+    t09 = AUDIO_COS_MUL(t03 - t09, 0.899976223136f);
     t03 = t05 + t07;
-    t07 = (t05 - t07) * 2.56291544774f;
+    t07 = AUDIO_COS_MUL(t05 - t07, 2.56291544774f);
     t05 = t15 + t03;
-    t15 = (t15 - t03) * 0.541196100146f;
+    t15 = AUDIO_COS_MUL(t15 - t03, 0.541196100146f);
     t03 = t33 + t11;
-    t11 = (t33 - t11) * 1.30656296488f;
+    t11 = AUDIO_COS_MUL(t33 - t11, 1.30656296488f);
     t33 = t05 + t03;
-    t05 = (t05 - t03) * 0.707106781187f;
+    t05 = AUDIO_COS_MUL(t05 - t03, 0.707106781187f);
     t03 = t15 + t11;
-    t15 = (t15 - t11) * 0.707106781187f;
+    t15 = AUDIO_COS_MUL(t15 - t11, 0.707106781187f);
     t03 += t15;
     t11 = t13 + t07;
-    t13 = (t13 - t07) * 0.541196100146f;
+    t13 = AUDIO_COS_MUL(t13 - t07, 0.541196100146f);
     t07 = t01 + t09;
-    t09 = (t01 - t09) * 1.30656296488f;
+    t09 = AUDIO_COS_MUL(t01 - t09, 1.30656296488f);
     t01 = t11 + t07;
-    t07 = (t11 - t07) * 0.707106781187f;
+    t07 = AUDIO_COS_MUL(t11 - t07, 0.707106781187f);
     t11 = t13 + t09;
-    t13 = (t13 - t09) * 0.707106781187f;
+    t13 = AUDIO_COS_MUL(t13 - t09, 0.707106781187f);
     t11 += t13;
     t01 += t11;
     t11 += t07;
     t07 += t13;
     t09 = t31 + t17;
-    t31 = (t31 - t17) * 0.509795579104f;
+    t31 = AUDIO_COS_MUL(t31 - t17, 0.509795579104f);
     t17 = t29 + t19;
-    t29 = (t29 - t19) * 0.601344886935f;
+    t29 = AUDIO_COS_MUL(t29 - t19, 0.601344886935f);
     t19 = t27 + t21;
-    t21 = (t27 - t21) * 0.899976223136f;
+    t21 = AUDIO_COS_MUL(t27 - t21, 0.899976223136f);
     t27 = t25 + t23;
-    t23 = (t25 - t23) * 2.56291544774f;
+    t23 = AUDIO_COS_MUL(t25 - t23, 2.56291544774f);
     t25 = t09 + t27;
-    t09 = (t09 - t27) * 0.541196100146f;
+    t09 = AUDIO_COS_MUL(t09 - t27, 0.541196100146f);
     t27 = t17 + t19;
-    t19 = (t17 - t19) * 1.30656296488f;
+    t19 = AUDIO_COS_MUL(t17 - t19, 1.30656296488f);
     t17 = t25 + t27;
-    t27 = (t25 - t27) * 0.707106781187f;
+    t27 = AUDIO_COS_MUL(t25 - t27, 0.707106781187f);
     t25 = t09 + t19;
-    t19 = (t09 - t19) * 0.707106781187f;
+    t19 = AUDIO_COS_MUL(t09 - t19, 0.707106781187f);
     t25 += t19;
     t09 = t31 + t23;
-    t31 = (t31 - t23) * 0.541196100146f;
+    t31 = AUDIO_COS_MUL(t31 - t23, 0.541196100146f);
     t23 = t29 + t21;
-    t21 = (t29 - t21) * 1.30656296488f;
+    t21 = AUDIO_COS_MUL(t29 - t21, 1.30656296488f);
     t29 = t09 + t23;
-    t23 = (t09 - t23) * 0.707106781187f;
+    t23 = AUDIO_COS_MUL(t09 - t23, 0.707106781187f);
     t09 = t31 + t21;
-    t31 = (t31 - t21) * 0.707106781187f;
+    t31 = AUDIO_COS_MUL(t31 - t21, 0.707106781187f);
     t09 += t31;
     t29 += t09;
     t09 += t23;
@@ -594,75 +686,75 @@ void audio_matrix_transform(int s[32][3], int ss, float *d, int dp) {
     t23 += t19;
     t19 += t31;
     t21 = t02 + t32;
-    t02 = (t02 - t32) * 0.502419286188f;
+    t02 = AUDIO_COS_MUL(t02 - t32, 0.502419286188f);
     t32 = t04 + t30;
-    t04 = (t04 - t30) * 0.52249861494f;
+    t04 = AUDIO_COS_MUL(t04 - t30, 0.52249861494f);
     t30 = t06 + t28;
-    t28 = (t06 - t28) * 0.566944034816f;
+    t28 = AUDIO_COS_MUL(t06 - t28, 0.566944034816f);
     t06 = t08 + t26;
-    t08 = (t08 - t26) * 0.64682178336f;
+    t08 = AUDIO_COS_MUL(t08 - t26, 0.64682178336f);
     t26 = t10 + t24;
-    t10 = (t10 - t24) * 0.788154623451f;
+    t10 = AUDIO_COS_MUL(t10 - t24, 0.788154623451f);
     t24 = t12 + t22;
-    t22 = (t12 - t22) * 1.06067768599f;
+    t22 = AUDIO_COS_MUL(t12 - t22, 1.06067768599f);
     t12 = t14 + t20;
-    t20 = (t14 - t20) * 1.72244709824f;
+    t20 = AUDIO_COS_MUL(t14 - t20, 1.72244709824f);
     t14 = t16 + t18;
-    t16 = (t16 - t18) * 5.10114861869f;
+    t16 = AUDIO_COS_MUL(t16 - t18, 5.10114861869f);
     t18 = t21 + t14;
-    t14 = (t21 - t14) * 0.509795579104f;
+    t14 = AUDIO_COS_MUL(t21 - t14, 0.509795579104f);
     t21 = t32 + t12;
-    t32 = (t32 - t12) * 0.601344886935f;
+    t32 = AUDIO_COS_MUL(t32 - t12, 0.601344886935f);
     t12 = t30 + t24;
-    t24 = (t30 - t24) * 0.899976223136f;
+    t24 = AUDIO_COS_MUL(t30 - t24, 0.899976223136f);
     t30 = t06 + t26;
-    t26 = (t06 - t26) * 2.56291544774f;
+    t26 = AUDIO_COS_MUL(t06 - t26, 2.56291544774f);
     t06 = t18 + t30;
-    t18 = (t18 - t30) * 0.541196100146f;
+    t18 = AUDIO_COS_MUL(t18 - t30, 0.541196100146f);
     t30 = t21 + t12;
-    t12 = (t21 - t12) * 1.30656296488f;
+    t12 = AUDIO_COS_MUL(t21 - t12, 1.30656296488f);
     t21 = t06 + t30;
-    t30 = (t06 - t30) * 0.707106781187f;
+    t30 = AUDIO_COS_MUL(t06 - t30, 0.707106781187f);
     t06 = t18 + t12;
-    t12 = (t18 - t12) * 0.707106781187f;
+    t12 = AUDIO_COS_MUL(t18 - t12, 0.707106781187f);
     t06 += t12;
     t18 = t14 + t26;
-    t26 = (t14 - t26) * 0.541196100146f;
+    t26 = AUDIO_COS_MUL(t14 - t26, 0.541196100146f);
     t14 = t32 + t24;
-    t24 = (t32 - t24) * 1.30656296488f;
+    t24 = AUDIO_COS_MUL(t32 - t24, 1.30656296488f);
     t32 = t18 + t14;
-    t14 = (t18 - t14) * 0.707106781187f;
+    t14 = AUDIO_COS_MUL(t18 - t14, 0.707106781187f);
     t18 = t26 + t24;
-    t24 = (t26 - t24) * 0.707106781187f;
+    t24 = AUDIO_COS_MUL(t26 - t24, 0.707106781187f);
     t18 += t24;
     t32 += t18;
     t18 += t14;
     t26 = t14 + t24;
     t14 = t02 + t16;
-    t02 = (t02 - t16) * 0.509795579104f;
+    t02 = AUDIO_COS_MUL(t02 - t16, 0.509795579104f);
     t16 = t04 + t20;
-    t04 = (t04 - t20) * 0.601344886935f;
+    t04 = AUDIO_COS_MUL(t04 - t20, 0.601344886935f);
     t20 = t28 + t22;
-    t22 = (t28 - t22) * 0.899976223136f;
+    t22 = AUDIO_COS_MUL(t28 - t22, 0.899976223136f);
     t28 = t08 + t10;
-    t10 = (t08 - t10) * 2.56291544774f;
+    t10 = AUDIO_COS_MUL(t08 - t10, 2.56291544774f);
     t08 = t14 + t28;
-    t14 = (t14 - t28) * 0.541196100146f;
+    t14 = AUDIO_COS_MUL(t14 - t28, 0.541196100146f);
     t28 = t16 + t20;
-    t20 = (t16 - t20) * 1.30656296488f;
+    t20 = AUDIO_COS_MUL(t16 - t20, 1.30656296488f);
     t16 = t08 + t28;
-    t28 = (t08 - t28) * 0.707106781187f;
+    t28 = AUDIO_COS_MUL(t08 - t28, 0.707106781187f);
     t08 = t14 + t20;
-    t20 = (t14 - t20) * 0.707106781187f;
+    t20 = AUDIO_COS_MUL(t14 - t20, 0.707106781187f);
     t08 += t20;
     t14 = t02 + t10;
-    t02 = (t02 - t10) * 0.541196100146f;
+    t02 = AUDIO_COS_MUL(t02 - t10, 0.541196100146f);
     t10 = t04 + t22;
-    t22 = (t04 - t22) * 1.30656296488f;
+    t22 = AUDIO_COS_MUL(t04 - t22, 1.30656296488f);
     t04 = t14 + t10;
-    t10 = (t14 - t10) * 0.707106781187f;
+    t10 = AUDIO_COS_MUL(t14 - t10, 0.707106781187f);
     t14 = t02 + t22;
-    t02 = (t02 - t22) * 0.707106781187f;
+    t02 = AUDIO_COS_MUL(t02 - t22, 0.707106781187f);
     t14 += t02;
     t04 += t14;
     t14 += t10;
@@ -738,7 +830,7 @@ void audio_matrix_transform(int s[32][3], int ss, float *d, int dp) {
     d[dp + 14] = t31;
     d[dp + 17] = -t02;
     d[dp + 15] = t02;
-    d[dp + 16] = 0.0;
+    d[dp + 16] = 0;
 }
 
 
@@ -851,8 +943,8 @@ void Mpeg1AudioDecoder::decodeFrame() {
                         int d_index = 512 - (v_pos >> 1);
                         int v_index = (v_pos % 128) >> 1;
                         while (v_index < 1024) {
-                            for (float & i : U) {
-                                i += AUDIO_SYNTHESIS_WINDOW[(d_index++) & 511] * V[ch][v_index++];
+                            for (audio_real_t & i : U) {
+                                i += audioWindowMul((d_index++) & 511, V[ch][v_index++]);
                             }
 
                             v_index += 128 - 32;
@@ -862,8 +954,8 @@ void Mpeg1AudioDecoder::decodeFrame() {
                         d_index -= (512 - 32);
                         v_index = (128 - 32 + 1024) - v_index;
                         while (v_index < 1024) {
-                            for (float & i : U) {
-                                i += AUDIO_SYNTHESIS_WINDOW[(d_index++) & 511] * V[ch][v_index++];
+                            for (audio_real_t & i : U) {
+                                i += audioWindowMul((d_index++) & 511, V[ch][v_index++]);
                             }
 
                             v_index += 128 - 32;
@@ -871,10 +963,8 @@ void Mpeg1AudioDecoder::decodeFrame() {
                         }
 
                         // Output samples
-                        for (const float j: U) {
-                            // TODO output samples
-                            // samples.interleaved[((out_pos + j) << 1) + ch] = U[j] / 2147418112.0f;
-                            m_soundBuffer.writeByte(j / 2147418112.0f);
+                        for (const audio_real_t j: U) {
+                            m_soundBuffer.writeByte(audioOutputSample(j));
                         }
                     } // End of synthesis channel loop
                     out_pos += 32;

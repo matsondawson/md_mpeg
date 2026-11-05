@@ -80,6 +80,17 @@ update-desktop-database ~/.local/share/applications
 xdg-mime default md_mpeg.desktop video/mpeg
 ```
 
+## Fixed point audio
+
+The MP2 decoder uses integers by default, with no value wider than 32 bits, and outputs 16-bit samples. Turn
+`MD_MPEG_AUDIO_FIXED_POINT` off to use floating point and output 32-bit float samples instead:
+
+```bash
+cmake -S . -B build -DMD_MPEG_AUDIO_FIXED_POINT=OFF
+```
+
+Without CMake, define it as 0 or 1 on the compiler command line. `src/mpeg1/AudioSample.h` has the default.
+
 ## Tests
 
 The tests generate small test clips with ffmpeg (no media is stored in the repository) and decode them

@@ -10,7 +10,7 @@
 #include <optional>
 #include <string>
 
-#include "../stream/RingBufferTyped.h"
+#include "../mpeg1/AudioSample.h"
 #include "ControlBar.h"
 
 struct free_delete {
@@ -52,7 +52,7 @@ private:
 public:
 	SDL_AudioStream* m_soundStream{};
 	SDL_AudioSpec m_wav_spec{};
-	MStream::RingBufferTyped<float, 32768>* m_soundBuffer{};
+	AudioSampleBuffer* m_soundBuffer{};
 
 	// Audio clock state. Written by the SDL audio thread, read by the main thread.
 	std::mutex m_audioPositionMutex;
@@ -75,7 +75,7 @@ public:
 	void clear() const;
 
 	// Opens the audio device paused; call startAudio() once enough audio is buffered
-	void initAudio(uint32_t frequencyHz, uint32_t channels, MStream::RingBufferTyped<float, 32768>* soundBuffer);
+	void initAudio(uint32_t frequencyHz, uint32_t channels, AudioSampleBuffer* soundBuffer);
 	[[nodiscard]] bool hasAudio() const { return m_soundStream != nullptr; }
 	[[nodiscard]] bool audioPlaying() const { return m_audioPlaying; }
 	// Starts playback. firstPtsMs is the PTS of the first sample in the sound buffer.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../common.h"
+#include "AudioSample.h"
 #include "../stream/MStream.h"
 #include "../stream/RingBufferTyped.h"
 #include "../stream/RingBufferWithSizeEvent.h"
@@ -8,6 +9,13 @@
 #include "Mpeg1VideoDecoder.h"
 
 #include <functional>
+
+// Type of the values in the synthesis filter
+#if MD_MPEG_AUDIO_FIXED_POINT
+using audio_real_t = int32_t;
+#else
+using audio_real_t = float;
+#endif
 
 typedef struct quantizer_spec_t {
 	unsigned short levels;
@@ -19,10 +27,10 @@ typedef struct quantizer_spec_t {
 class Mpeg1AudioDecoder final : public MStream::IWriteByteStream
 {
 private:
-	std::function<void(uint32_t frequency, uint32_t channels, MStream::RingBufferTyped<float, 32768>* soundBuffer)> m_frameCallback;
+	std::function<void(uint32_t frequency, uint32_t channels, AudioSampleBuffer* soundBuffer)> m_frameCallback;
 	int m_decoderState;
 
-	MStream::RingBufferTyped<float, 32768> m_soundBuffer;
+	AudioSampleBuffer m_soundBuffer;
 
 	bool m_hasLoggedHeaderInfo = false;
 
@@ -63,8 +71,8 @@ private:
 	uint8_t m_scale_factor[2][32][3]{0};
 	int sample[2][32][3]{0};
 
-	float V[2][1024]{0};
-	float U[32]{0};
+	audio_real_t V[2][1024]{0};
+	audio_real_t U[32]{0};
 
 public:
 	MStream::RingBufferWithSizeEvent<128*1024> m_stream;
@@ -75,7 +83,7 @@ public:
 	Mpeg1AudioDecoder();
 
 public:
-	void setFrameCallback(const std::function<void(uint32_t frequency, uint32_t channels, MStream::RingBufferTyped<float, 32768>* soundBuffer)> &);
+	void setFrameCallback(const std::function<void(uint32_t frequency, uint32_t channels, AudioSampleBuffer* soundBuffer)> &);
 
 	// Samples per channel in one MPEG-1 layer II frame
 	static constexpr uint32_t SAMPLES_PER_FRAME = 1152;
