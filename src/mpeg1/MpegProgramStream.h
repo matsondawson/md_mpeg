@@ -371,22 +371,24 @@ namespace Mpeg1 {
 			}
 			// Average rate over the whole file if its end is known, else between the first and latest pack,
 			// falling back to the header's mux rate
-			double bytesPerMillisecond = m_muxRateBytesPerSecond / 1000.0;
+			int64_t rateBytes = m_muxRateBytesPerSecond;
+			int64_t rateMillis = 1000;
 			if (m_endScrMillis - m_firstScrMillis >= 200 && m_endPackPosition > m_firstPackPosition) {
-				bytesPerMillisecond = static_cast<double>(m_endPackPosition - m_firstPackPosition)
-				                      / static_cast<double>(m_endScrMillis - m_firstScrMillis);
+				rateBytes = m_endPackPosition - m_firstPackPosition;
+				rateMillis = m_endScrMillis - m_firstScrMillis;
 			} else if (m_lastScrMillis - m_firstScrMillis >= 200) {
-				bytesPerMillisecond = static_cast<double>(m_lastPackPosition - m_firstPackPosition)
-				                      / static_cast<double>(m_lastScrMillis - m_firstScrMillis);
+				rateBytes = m_lastPackPosition - m_firstPackPosition;
+				rateMillis = m_lastScrMillis - m_firstScrMillis;
 			}
-			if (bytesPerMillisecond <= 0) {
+			if (rateBytes <= 0) {
 				return -1;
 			}
 			// Video is muxed ahead of its presentation time
 			const int64_t videoLeadMillis = m_lastVideoPtsMillis >= 0 ? m_lastVideoPtsMillis - m_lastScrMillis : 0;
 			const int64_t targetScrMillis = targetPtsMillis - videoLeadMillis;
-			const auto position = m_lastPackPosition
-			                      + static_cast<int64_t>((targetScrMillis - m_lastScrMillis) * bytesPerMillisecond);
+			// Multiplied first to keep precision. Time is under 2^27 ms (33-bit clock), so this can't overflow
+			// for files under 64 GiB.
+			const int64_t position = m_lastPackPosition + (targetScrMillis - m_lastScrMillis) * rateBytes / rateMillis;
 			return std::max<int64_t>(0, position);
 		}
 
