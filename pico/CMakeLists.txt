@@ -30,10 +30,14 @@ function(add_decoder_app name main_source)
 	target_compile_definitions(${name} PRIVATE
 		MD_MPEG_AUDIO_FIXED_POINT=1
 		MD_MPEG_DEMUX_RING_SIZE=512
-		MD_MPEG_VIDEO_RING_SIZE=9216
+		# Holds the largest picture. Measured peaks: termaudio 9049 bytes, a 140x120 variable bit rate
+		# file 10378 (its header declared 6 KB, so headers can't be trusted for this)
+		MD_MPEG_VIDEO_RING_SIZE=16384
 		MD_MPEG_AUDIO_RING_SIZE=384
 		MD_MPEG_SOUND_RING_SIZE=4096
 		PICO_STACK_SIZE=0x1000
+		# Out of memory throws std::bad_alloc, so a picture too big for memory can be skipped
+		PICO_MALLOC_PANIC=0
 	)
 	target_compile_options(${name} PRIVATE
 		$<$<COMPILE_LANGUAGE:ASM>:-Wa,-I${MD_MPEG_CLIP_DIR}>
@@ -48,10 +52,8 @@ endfunction()
 
 add_decoder_app(benchmark_flash benchmark.cpp)
 add_decoder_app(video_player video_player.cpp)
-add_decoder_app(video_player_scaled video_player.cpp)
-target_compile_definitions(video_player_scaled PRIVATE VIDEO_SCALED=1)
 add_decoder_app(video_player_sd video_player.cpp)
-target_compile_definitions(video_player_sd PRIVATE VIDEO_SCALED=1 VIDEO_FROM_SD=1)
+target_compile_definitions(video_player_sd PRIVATE VIDEO_FROM_SD=1)
 
 add_executable(display_test display_test.cpp)
 target_link_libraries(display_test PRIVATE pico_stdlib hardware_spi)

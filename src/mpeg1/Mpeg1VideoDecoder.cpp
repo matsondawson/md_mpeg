@@ -1,6 +1,7 @@
 #include "Mpeg1VideoDecoder.h"
 
 #include <algorithm>
+#include <new>
 
 
 enum {
@@ -86,6 +87,9 @@ void Mpeg1VideoDecoder::decodeOrResync() {
 		usedBefore = m_stream.used();
 		try {
 			decodeFrame2();
+		} catch (const std::bad_alloc &) {
+			// Not the stream's fault, and every later picture would fail the same way
+			throw;
 		} catch (const std::exception &ex) {
 			std::cout << "Corrupt video, skipping to next picture: " << ex.what() << std::endl;
 			resync();

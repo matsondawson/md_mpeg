@@ -143,11 +143,14 @@ Frame::~Frame() {
 
 void Frame::init(const int32_t ptsMillis, const FrameSize frameSize) {
 	if (frameSize != m_frameSize) {
+		// Cleared before allocating, so a failed allocation leaves nothing freed twice
 		delete[] m_yData;
-		m_yData = new uint8_t[frameSize.luma_width * frameSize.luma_height]();
 		delete[] m_crData;
-		m_crData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		delete[] m_cbData;
+		m_yData = m_crData = m_cbData = nullptr;
+		m_frameSize = {};
+		m_yData = new uint8_t[frameSize.luma_width * frameSize.luma_height]();
+		m_crData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		m_cbData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		m_frameSize = frameSize;
 	}

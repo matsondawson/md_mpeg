@@ -2,14 +2,16 @@
 // of a FAT32 microSD card if built with VIDEO_FROM_SD. Audio is decoded but not played.
 //
 // With a card, the first .MPG plays, looping, and a button from GP15 to ground moves to the next one.
-// The screen shows why nothing is playing: red for a card or filesystem problem, blue for no .MPG.
+// The screen shows why nothing is playing: red for a card or filesystem problem, blue for no .MPG, and
+// magenta for 2 s before moving on from a file that can't be played.
 //
 // Core 0 demuxes and decodes. When a frame is due, core 1 converts it to RGB565 one line at a time and sends
 // the lines by DMA, so the decoder keeps running and no frame buffer is needed. A displayed frame stays
 // intact while the next one decodes, as it's the reference for it, unless it's a B-frame.
 // Frames more than one period late are skipped. Stats go to USB serial if connected.
 //
-// Build with VIDEO_SCALED for 1.75x (280x224) instead of 1x (160x128), interpolating pixels and lines.
+// Pictures of any size are scaled to the screen's height, interpolating pixels and lines, and cropped at the
+// left and right if they're then wider than the screen. A picture too big for memory moves to the next file.
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +19,8 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <new>
+#include <stdexcept>
 
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
@@ -39,18 +43,16 @@ extern "C" const uint8_t clip_end[];
 #endif
 
 namespace {
-	constexpr uint32_t SOURCE_WIDTH = 160;
-	constexpr uint32_t SOURCE_HEIGHT = 128;
-#if VIDEO_SCALED
-	constexpr uint32_t OUTPUT_WIDTH = 280;
-	constexpr uint32_t OUTPUT_HEIGHT = 224;
-#else
-	constexpr uint32_t OUTPUT_WIDTH = SOURCE_WIDTH;
-	constexpr uint32_t OUTPUT_HEIGHT = SOURCE_HEIGHT;
-#endif
-	constexpr int OUTPUT_X = (St7789::WIDTH - OUTPUT_WIDTH) / 2;
-	constexpr int OUTPUT_Y = (St7789::HEIGHT - OUTPUT_HEIGHT) / 2;
+	constexpr uint32_t SCREEN_WIDTH = St7789::WIDTH;
+	constexpr uint32_t SCREEN_HEIGHT = St7789::HEIGHT;
+	// Most source pixels converted for one line, which limits how wide the visible part of a picture can be
+	constexpr uint32_t MAX_SOURCE_SPAN = 400;
 	constexpr uint32_t REPORT_FRAMES = 125;
+
+	// A file that can't be played, rather than a card or decoding problem
+	struct Unplayable : std::runtime_error {
+		using std::runtime_error::runtime_error;
+	};
 
 	// BT.601 limited range YCbCr to RGB565. The M0+ has few registers, so red, green and blue travel together
 	// in one 32-bit value: red in bits 31-22, green in 21-11, blue in 10-0. Each field is its component plus
@@ -118,46 +120,114 @@ namespace {
 		return static_cast<uint16_t>(((a & 0xF7DEu) + (b & 0xF7DEu)) >> 1);
 	}
 
-	// Converts a line to RGB565
-	void __not_in_flash_func(convertLine)(const Frame &frame, const uint32_t row, uint16_t *out) {
-		const uint8_t *luma = frame.m_yData + row * frame.m_frameSize.luma_width;
-		const uint8_t *cr = frame.m_crData + (row / 2) * frame.m_frameSize.chroma_width;
-		const uint8_t *cb = frame.m_cbData + (row / 2) * frame.m_frameSize.chroma_width;
-		const uint32_t ditherEven = DITHER[row & 1][0], ditherOdd = DITHER[row & 1][1];
-#if VIDEO_SCALED
-		// 4 source pixels become 7, with interpolated pixels between them
-		for (const uint16_t *end = out + OUTPUT_WIDTH; out != end; out += 7) {
-			const uint32_t first = s_crTable[cr[0]] + s_cbTable[cb[0]];
-			const uint32_t second = s_crTable[cr[1]] + s_cbTable[cb[1]];
-			const uint16_t a = pixel(luma[0], first + ditherEven);
-			const uint16_t b = pixel(luma[1], first + ditherOdd);
-			const uint16_t c = pixel(luma[2], second + ditherEven);
-			const uint16_t d = pixel(luma[3], second + ditherOdd);
-			out[0] = a;
-			out[1] = average(a, b);
-			out[2] = b;
-			out[3] = average(b, c);
-			out[4] = c;
-			out[5] = average(c, d);
-			out[6] = d;
-			luma += 4;
-			cr += 2;
-			cb += 2;
+	// a weighted towards b by quarters, 0 to 3
+	template <uint32_t QUARTERS>
+	inline uint16_t blend(const uint16_t a, const uint16_t b) {
+		if constexpr (QUARTERS == 0) {
+			return a;
+		} else if constexpr (QUARTERS == 1) {
+			return average(a, average(a, b));
+		} else if constexpr (QUARTERS == 2) {
+			return average(a, b);
+		} else {
+			return average(average(a, b), b);
 		}
-#else
-		for (const uint16_t *end = out + OUTPUT_WIDTH; out != end; out += 2) {
+	}
+
+	// How pictures map to the screen. Core 0 rebuilds it while core 1 is idle; core 1 reads it during a scan.
+	// Positions are in quarters of a source pixel: the pixel, and how far towards the next one to blend.
+	struct ScalePlan {
+		uint32_t sourceWidth = 0, sourceHeight = 0;
+		// Screen columns shown, the rest stay black
+		uint32_t outputX = 0, outputWidth = 0;
+		// Source columns converted for each line, starting and ending on a chroma pair
+		uint32_t firstColumn = 0, columnCount = 0;
+		// Relative to firstColumn
+		uint16_t columns[SCREEN_WIDTH];
+		uint16_t rows[SCREEN_HEIGHT];
+	};
+
+	ScalePlan s_plan;
+
+	// Fills the screen's height, keeping the picture's proportions, and crops the sides equally if it's wider
+	void buildPlan(const uint32_t width, const uint32_t height) {
+		if (width == 0 || height == 0) {
+			throw Unplayable("Picture has no size");
+		}
+		// Source pixels per screen pixel, 16.16 fixed point
+		const uint32_t step = (height << 16) / SCREEN_HEIGHT;
+		// Where a screen pixel's centre falls in the source, clamped to the picture
+		const auto position = [step](const uint32_t screen, const uint32_t sourceSize) {
+			const int64_t fixed = (static_cast<int64_t>(2 * screen + 1) * step) / 2 - 0x8000;
+			const int64_t quarters = (fixed + 0x2000) >> 14;
+			return static_cast<uint32_t>(std::clamp<int64_t>(quarters, 0, (sourceSize - 1) * 4));
+		};
+
+		const uint32_t scaledWidth = std::max<uint32_t>(1, (width * SCREEN_HEIGHT + height / 2) / height);
+		const uint32_t outputWidth = std::min(SCREEN_WIDTH, scaledWidth);
+		const uint32_t crop = (scaledWidth - outputWidth) / 2;
+
+		const uint32_t first = position(crop, width);
+		const uint32_t last = position(crop + outputWidth - 1, width);
+		// Blending with the next column needs it converted too
+		const uint32_t firstColumn = (first / 4) & ~1u;
+		const uint32_t lastColumn = (last / 4 + (last % 4 ? 1 : 0)) | 1u;
+		const uint32_t columnCount = lastColumn - firstColumn + 1;
+		if (columnCount > MAX_SOURCE_SPAN) {
+			throw Unplayable("Picture too wide to scale");
+		}
+
+		s_plan.sourceWidth = width;
+		s_plan.sourceHeight = height;
+		s_plan.outputX = (SCREEN_WIDTH - outputWidth) / 2;
+		s_plan.outputWidth = outputWidth;
+		s_plan.firstColumn = firstColumn;
+		s_plan.columnCount = columnCount;
+		for (uint32_t x = 0; x < outputWidth; x++) {
+			s_plan.columns[x] = static_cast<uint16_t>(position(crop + x, width) - firstColumn * 4);
+		}
+		for (uint32_t y = 0; y < SCREEN_HEIGHT; y++) {
+			s_plan.rows[y] = static_cast<uint16_t>(position(y, height));
+		}
+		printf("Picture %lux%lu, shown %lux%lu, %lu columns cropped\n", width, height, outputWidth, SCREEN_HEIGHT,
+		       scaledWidth - outputWidth);
+	}
+
+	// Converts the plan's columns of a source line to RGB565
+	void __not_in_flash_func(convertLine)(const Frame &frame, const uint32_t row, uint16_t *out) {
+		const uint32_t firstColumn = s_plan.firstColumn;
+		const uint8_t *luma = frame.m_yData + row * frame.m_frameSize.luma_width + firstColumn;
+		const uint8_t *cr = frame.m_crData + (row / 2) * frame.m_frameSize.chroma_width + firstColumn / 2;
+		const uint8_t *cb = frame.m_cbData + (row / 2) * frame.m_frameSize.chroma_width + firstColumn / 2;
+		const uint32_t ditherEven = DITHER[row & 1][0], ditherOdd = DITHER[row & 1][1];
+		for (const uint16_t *end = out + s_plan.columnCount; out != end; out += 2) {
 			const uint32_t chroma = s_crTable[*cr++] + s_cbTable[*cb++];
 			out[0] = pixel(luma[0], chroma + ditherEven);
 			out[1] = pixel(luma[1], chroma + ditherOdd);
 			luma += 2;
 		}
-#endif
 	}
 
-	// The display wants big-endian pixels
-	void __not_in_flash_func(toDisplayOrder)(const uint16_t *in, uint16_t *out) {
-		for (uint32_t x = 0; x < OUTPUT_WIDTH; x++) {
-			out[x] = __builtin_bswap16(in[x]);
+	// Scales a converted source line to the screen's width
+	void __not_in_flash_func(scaleLine)(const uint16_t *in, uint16_t *out) {
+		const uint16_t *columns = s_plan.columns;
+		for (const uint16_t *end = out + s_plan.outputWidth; out != end; out++) {
+			const uint32_t position = *columns++;
+			const uint16_t *source = in + (position >> 2);
+			switch (position & 3) {
+				case 0: *out = source[0]; break;
+				case 1: *out = blend<1>(source[0], source[1]); break;
+				case 2: *out = blend<2>(source[0], source[1]); break;
+				default: *out = blend<3>(source[0], source[1]); break;
+			}
+		}
+	}
+
+	// Blends two scaled lines into display order, which is big-endian
+	template <uint32_t QUARTERS>
+	void __not_in_flash_func(blendLines)(const uint16_t *a, const uint16_t *b, uint16_t *out, const uint32_t width) {
+		for (uint32_t x = 0; x < width; x++) {
+			out[x] = __builtin_bswap16(blend<QUARTERS>(a[x], b[x]));
 		}
 	}
 
@@ -173,40 +243,51 @@ namespace {
 	void __not_in_flash_func(scanFrame)(const Frame &frame) {
 		const uint32_t scanStart = time_us_32();
 		uint32_t convertUs = 0;
-		// The last two source lines, and the output lines being sent or about to be. A line being sent can't
-		// be changed, and sendPixels() returns once the line before the one it's given has gone.
-		static uint16_t source[2][OUTPUT_WIDTH];
-		static uint16_t output[3][OUTPUT_WIDTH];
+		const uint32_t width = s_plan.outputWidth;
+		// One converted source line, two source lines scaled to the screen's width, and the output lines being
+		// sent or about to be. A line being sent can't be changed, and sendPixels() returns once the line
+		// before the one it's given has gone.
+		static uint16_t source[MAX_SOURCE_SPAN];
+		static uint16_t scaled[2][SCREEN_WIDTH];
+		static uint16_t output[3][SCREEN_WIDTH];
+		int32_t scaledRow[2] = {-1, -1};
 		uint32_t nextOutput = 0;
-		const auto send = [&](const uint16_t *line) {
-			uint16_t *out = output[nextOutput];
-			nextOutput = (nextOutput + 1) % 3;
-			toDisplayOrder(line, out);
-			s_display.sendPixels(reinterpret_cast<const uint8_t *>(out), OUTPUT_WIDTH * 2);
+
+		// A source line scaled, reusing the last two, and not replacing the slot given in keep
+		const auto scaledLine = [&](const uint32_t row, const int keep) -> int {
+			for (int slot = 0; slot < 2; slot++) {
+				if (scaledRow[slot] == static_cast<int32_t>(row)) {
+					return slot;
+				}
+			}
+			// Rows only go down the picture, so the older line is the one to replace
+			const int slot = keep >= 0 ? keep ^ 1 : scaledRow[0] < scaledRow[1] ? 0 : 1;
+			convertLine(frame, row, source);
+			scaleLine(source, scaled[slot]);
+			scaledRow[slot] = static_cast<int32_t>(row);
+			return slot;
 		};
 
-		s_display.beginPixels(OUTPUT_X, OUTPUT_Y, OUTPUT_WIDTH, OUTPUT_HEIGHT);
-		for (uint32_t row = 0; row < SOURCE_HEIGHT; row++) {
-			uint16_t *line = source[row & 1];
+		s_display.beginPixels(static_cast<int>(s_plan.outputX), 0, static_cast<int>(width), SCREEN_HEIGHT);
+		for (uint32_t y = 0; y < SCREEN_HEIGHT; y++) {
 			const uint32_t convertStart = time_us_32();
-			convertLine(frame, row, line);
-#if VIDEO_SCALED
-			// 4 source lines become 7, with interpolated lines between them
-			if (row & 3) {
-				static uint16_t between[OUTPUT_WIDTH];
-				const uint16_t *previous = source[(row & 1) ^ 1];
-				for (uint32_t x = 0; x < OUTPUT_WIDTH; x++) {
-					between[x] = average(previous[x], line[x]);
-				}
-				convertUs += time_us_32() - convertStart;
-				send(between);
+			const uint32_t position = s_plan.rows[y];
+			const uint16_t *a = scaled[scaledLine(position >> 2, -1)];
+			uint16_t *out = output[nextOutput];
+			nextOutput = (nextOutput + 1) % 3;
+			if ((position & 3) == 0) {
+				blendLines<0>(a, a, out, width);
 			} else {
-				convertUs += time_us_32() - convertStart;
+				const int slotA = static_cast<int>(a == scaled[1]);
+				const uint16_t *b = scaled[scaledLine((position >> 2) + 1, slotA)];
+				switch (position & 3) {
+					case 1: blendLines<1>(a, b, out, width); break;
+					case 2: blendLines<2>(a, b, out, width); break;
+					default: blendLines<3>(a, b, out, width); break;
+				}
 			}
-#else
 			convertUs += time_us_32() - convertStart;
-#endif
-			send(line);
+			s_display.sendPixels(reinterpret_cast<const uint8_t *>(out), width * 2);
 		}
 		s_display.endPixels();
 		const uint32_t scanUs = time_us_32() - scanStart;
@@ -311,6 +392,8 @@ namespace {
 	};
 
 	Stats s_stats;
+	// Most of the video ring used since the file started, sampled between packets, so up to a packet low
+	uint32_t s_videoRingPeak = 0;
 
 	void waitForScan() {
 		const uint64_t start = time_us_64();
@@ -338,6 +421,7 @@ namespace {
 		const uint32_t cardUs = s_timedCard.totalUs;
 		s_timedCard.maxUs = 0;
 #endif
+		printf("  video ring peak %lu of %d bytes\n", s_videoRingPeak, MD_MPEG_VIDEO_RING_SIZE);
 		s_stats = Stats{};
 		s_stats.startUs = now;
 #if VIDEO_FROM_SD
@@ -348,9 +432,18 @@ namespace {
 		s_core1MaxScanUs = 0;
 	}
 
-	// @return true if the next file button stopped playback
-	bool play(MStream::IReadByteStream &input) {
-		bool nextRequested = false;
+	enum class PlayEnd {
+		// At the end of the file, or stopped by an error reading it
+		Finished,
+		NextRequested,
+		Unplayable
+	};
+
+	PlayEnd play(MStream::IReadByteStream &input) {
+		PlayEnd result = PlayEnd::Finished;
+		// The first picture sets the plan and clears the screen around it
+		s_plan.sourceWidth = s_plan.sourceHeight = 0;
+		s_videoRingPeak = 0;
 		auto demuxer = std::make_unique<Mpeg1::MpegProgramStream>();
 		auto videoDecoder = std::make_unique<Mpeg1VideoDecoder>();
 		auto audioDecoder = std::make_unique<Mpeg1AudioDecoder>();
@@ -364,7 +457,8 @@ namespace {
 
 		videoDecoder->setFrameCallback([&](const Frame &frame) {
 			const int64_t ptsMs = timestamper.next(frame.m_ptsMillis, videoDecoder->m_frame_period_millis);
-			if (ptsMs < 0 || videoDecoder->m_width != SOURCE_WIDTH || videoDecoder->m_height != SOURCE_HEIGHT) {
+			// A reference picture never decoded, after an error, has no data
+			if (ptsMs < 0 || !frame.m_yData) {
 				return;
 			}
 			if (!timelineStarted) {
@@ -376,6 +470,14 @@ namespace {
 
 			// The previous frame's data can be overwritten once this returns
 			waitForScan();
+
+			// Core 1 is idle, so the plan and the screen can change
+			if (videoDecoder->m_width != s_plan.sourceWidth || videoDecoder->m_height != s_plan.sourceHeight) {
+				buildPlan(videoDecoder->m_width, videoDecoder->m_height);
+				printf("  %.2f fps, %lu bit/s, %lu KB picture buffer declared\n", videoDecoder->m_frame_rate,
+				       videoDecoder->bit_rate, videoDecoder->vbv_buffer_size);
+				s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, 0x0000);
+			}
 
 			const uint64_t now = time_us_64();
 			if (now > dueUs + periodUs) {
@@ -409,13 +511,14 @@ namespace {
 			uint32_t lastInputBytes = s_inputBytes;
 			uint64_t lastProgressUs = time_us_64();
 			while (demuxer->nextPacket(input) != Mpeg1::DemuxResult::EndOfStream) {
+				s_videoRingPeak = std::max(s_videoRingPeak, videoDecoder->m_stream.used());
 				// No audio output yet, so discard the samples
 				while (soundBuffer && !soundBuffer->isEmpty()) {
 					soundBuffer->nextByte();
 				}
 #if VIDEO_FROM_SD
 				if (s_nextButton.pressed()) {
-					nextRequested = true;
+					result = PlayEnd::NextRequested;
 					break;
 				}
 #endif
@@ -426,9 +529,16 @@ namespace {
 					lastProgressUs = now;
 				} else if (now - lastProgressUs > 3000000) {
 					printf("Playback stalled, a picture may be bigger than the %d byte video ring\n", MD_MPEG_VIDEO_RING_SIZE);
+					result = PlayEnd::Unplayable;
 					break;
 				}
 			}
+		} catch (const std::bad_alloc &) {
+			printf("Not enough memory for %lux%lu pictures\n", videoDecoder->m_width, videoDecoder->m_height);
+			result = PlayEnd::Unplayable;
+		} catch (const Unplayable &ex) {
+			printf("%s\n", ex.what());
+			result = PlayEnd::Unplayable;
 		} catch (const std::exception &ex) {
 			printf("Decoder error: %s\n", ex.what());
 		}
@@ -438,7 +548,7 @@ namespace {
 		delete videoDecoder->m_ptrFramePast;
 		delete videoDecoder->m_ptrFrameCurrent;
 		delete videoDecoder->m_ptrFrameFuture;
-		return nextRequested;
+		return result;
 	}
 }
 
@@ -459,11 +569,11 @@ int main() {
 	s_spiHz = s_display.init(50000000);
 	s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, 0x0000);
 	multicore_launch_core1(core1Main);
-	printf("video player, %lux%lu, sys %lu MHz, SPI %u Hz\n", OUTPUT_WIDTH, OUTPUT_HEIGHT, clock_get_hz(clk_sys) / 1000000, s_spiHz);
+	printf("video player, %lux%lu screen, sys %lu MHz, SPI %u Hz\n", SCREEN_WIDTH, SCREEN_HEIGHT, clock_get_hz(clk_sys) / 1000000, s_spiHz);
 
 	s_stats.startUs = time_us_64();
 #if VIDEO_FROM_SD
-	constexpr uint16_t COLOR_BLACK = 0x0000, COLOR_RED = 0xF800, COLOR_BLUE = 0x001F;
+	constexpr uint16_t COLOR_BLACK = 0x0000, COLOR_RED = 0xF800, COLOR_BLUE = 0x001F, COLOR_MAGENTA = 0xF81F;
 	uint16_t screenColor = COLOR_BLACK;
 	const auto showStatus = [&](const uint16_t color) {
 		if (color != screenColor) {
@@ -522,10 +632,18 @@ int main() {
 			printf("Playing %s (%lu of %lu)\n", video.name, fileIndex + 1, videoCount);
 			// On the heap, as the decoder's own stack use comes on top of this
 			auto stream = std::make_unique<CardFileStream>(video);
-			if (play(*stream)) {
-				fileIndex++;
-				// Clears the last picture, in case the next file's are another size and never cover it
-				s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, COLOR_BLACK);
+			switch (play(*stream)) {
+				case PlayEnd::Finished:
+					break;
+				case PlayEnd::NextRequested:
+					fileIndex++;
+					s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, COLOR_BLACK);
+					break;
+				case PlayEnd::Unplayable:
+					fileIndex++;
+					showStatus(COLOR_MAGENTA);
+					sleep_ms(2000);
+					break;
 			}
 		} catch (const std::exception &ex) {
 			fail(ex.what(), COLOR_RED);
