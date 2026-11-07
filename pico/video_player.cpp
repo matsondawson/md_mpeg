@@ -1,7 +1,8 @@
-// Plays video on an ST7789V, looping, from the embedded clip or from the first .MPG file in the root directory
+// Plays video on an ST7789V, looping, from the embedded clip or from the .MPG files in the root directory
 // of a FAT32 microSD card if built with VIDEO_FROM_SD. Audio is decoded but not played.
 //
-// With a card, the screen shows why nothing is playing: red for a card or filesystem problem, blue for no .MPG.
+// With a card, the first .MPG plays, looping, and a button from GP15 to ground moves to the next one.
+// The screen shows why nothing is playing: red for a card or filesystem problem, blue for no .MPG.
 //
 // Core 0 demuxes and decodes. When a frame is due, core 1 converts it to RGB565 one line at a time and sends
 // the lines by DMA, so the decoder keeps running and no frame buffer is needed. A displayed frame stays
@@ -29,6 +30,7 @@
 #include "mpeg1/MpegProgramStream.h"
 
 #if VIDEO_FROM_SD
+#include "Button.h"
 #include "Fat32.h"
 #include "SdCard.h"
 #else
@@ -254,6 +256,9 @@ namespace {
 	TimedCard s_timedCard(s_card);
 	Volume s_volume(s_timedCard);
 
+	constexpr uint PIN_NEXT_BUTTON = 15;
+	Button s_nextButton(PIN_NEXT_BUTTON);
+
 	class CardFileStream final : public MStream::IReadByteStream {
 		Volume::File m_file;
 
@@ -343,7 +348,9 @@ namespace {
 		s_core1MaxScanUs = 0;
 	}
 
-	void play(MStream::IReadByteStream &input) {
+	// @return true if the next file button stopped playback
+	bool play(MStream::IReadByteStream &input) {
+		bool nextRequested = false;
 		auto demuxer = std::make_unique<Mpeg1::MpegProgramStream>();
 		auto videoDecoder = std::make_unique<Mpeg1VideoDecoder>();
 		auto audioDecoder = std::make_unique<Mpeg1AudioDecoder>();
@@ -406,6 +413,12 @@ namespace {
 				while (soundBuffer && !soundBuffer->isEmpty()) {
 					soundBuffer->nextByte();
 				}
+#if VIDEO_FROM_SD
+				if (s_nextButton.pressed()) {
+					nextRequested = true;
+					break;
+				}
+#endif
 				// A picture too big for the video ring stops all input, for good
 				const uint64_t now = time_us_64();
 				if (s_inputBytes != lastInputBytes) {
@@ -425,6 +438,7 @@ namespace {
 		delete videoDecoder->m_ptrFramePast;
 		delete videoDecoder->m_ptrFrameCurrent;
 		delete videoDecoder->m_ptrFrameFuture;
+		return nextRequested;
 	}
 }
 
@@ -463,6 +477,9 @@ int main() {
 		sleep_ms(1000);
 	};
 
+	s_nextButton.init();
+	// Which .MPG plays, counting in directory order. Wraps to the first after the last.
+	uint32_t fileIndex = 0;
 	for (;;) {
 		try {
 			if (const char *error = s_card.init()) {
@@ -475,27 +492,41 @@ int main() {
 				continue;
 			}
 
-			Volume::Entry video{};
-			bool found = false;
+			Volume::Entry first{}, video{};
+			uint32_t videoCount = 0;
 			s_volume.forEachFile([&](const Volume::Entry &entry) {
 				printf("  %-12s %lu bytes\n", entry.name, entry.size);
 				const char *extension = strrchr(entry.name, '.');
-				if (!found && entry.size > 0 && extension && strcmp(extension, ".MPG") == 0) {
-					video = entry;
-					found = true;
+				if (entry.size > 0 && extension && strcmp(extension, ".MPG") == 0) {
+					if (videoCount == 0) {
+						first = entry;
+					}
+					if (videoCount == fileIndex) {
+						video = entry;
+					}
+					videoCount++;
 				}
 				return true;
 			});
-			if (!found) {
+			if (videoCount == 0) {
 				fail("No .MPG file in the root directory", COLOR_BLUE);
 				continue;
 			}
+			// Past the last one, or the card changed
+			if (fileIndex >= videoCount) {
+				fileIndex = 0;
+				video = first;
+			}
 
 			showStatus(COLOR_BLACK);
-			printf("Playing %s\n", video.name);
+			printf("Playing %s (%lu of %lu)\n", video.name, fileIndex + 1, videoCount);
 			// On the heap, as the decoder's own stack use comes on top of this
 			auto stream = std::make_unique<CardFileStream>(video);
-			play(*stream);
+			if (play(*stream)) {
+				fileIndex++;
+				// Clears the last picture, in case the next file's are another size and never cover it
+				s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, COLOR_BLACK);
+			}
 		} catch (const std::exception &ex) {
 			fail(ex.what(), COLOR_RED);
 		}
