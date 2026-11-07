@@ -3,8 +3,9 @@ cmake_minimum_required(VERSION 3.20)
 # The decoders use exceptions for end of data and corrupt streams
 set(PICO_CXX_ENABLE_EXCEPTIONS 1)
 set(PICO_CXX_ENABLE_RTTI 1)
-# Also runs on a Pico W, leaving its wireless chip unused
-set(PICO_BOARD pico)
+# pico (RP2040, also runs on a Pico W, leaving its wireless chip unused) or pico2 (RP2350). Each board needs
+# its own build directory, as pico/pico.sh uses.
+set(PICO_BOARD pico CACHE STRING "Board to build for: pico or pico2")
 
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
@@ -16,6 +17,15 @@ pico_sdk_init()
 
 set(MD_MPEG_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(MD_MPEG_CLIP_DIR "" CACHE PATH "Directory holding clip.mpg, the clip to embed")
+
+# The video ring holds the largest picture. Measured peaks: termaudio 9049 bytes, a 140x120 variable bit
+# rate file 10378 (its header declared 6 KB, so headers can't be trusted for this). The RP2350's 520 KB of
+# RAM leaves room for bigger pictures and a bigger ring.
+if(PICO_BOARD STREQUAL "pico2")
+	set(MD_MPEG_PICO_VIDEO_RING_SIZE 32768)
+else()
+	set(MD_MPEG_PICO_VIDEO_RING_SIZE 16384)
+endif()
 
 function(add_decoder_app name main_source)
 	add_executable(${name}
@@ -30,9 +40,7 @@ function(add_decoder_app name main_source)
 	target_compile_definitions(${name} PRIVATE
 		MD_MPEG_AUDIO_FIXED_POINT=1
 		MD_MPEG_DEMUX_RING_SIZE=512
-		# Holds the largest picture. Measured peaks: termaudio 9049 bytes, a 140x120 variable bit rate
-		# file 10378 (its header declared 6 KB, so headers can't be trusted for this)
-		MD_MPEG_VIDEO_RING_SIZE=16384
+		MD_MPEG_VIDEO_RING_SIZE=${MD_MPEG_PICO_VIDEO_RING_SIZE}
 		MD_MPEG_AUDIO_RING_SIZE=384
 		MD_MPEG_SOUND_RING_SIZE=4096
 		PICO_STACK_SIZE=0x1000

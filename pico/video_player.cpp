@@ -23,10 +23,10 @@
 #include <stdexcept>
 
 #include "hardware/clocks.h"
-#include "hardware/vreg.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 
+#include "Clocks.h"
 #include "DisplayTimestamper.h"
 #include "St7789.h"
 #include "mpeg1/Mpeg1AudioDecoder.h"
@@ -553,12 +553,7 @@ namespace {
 }
 
 int main() {
-	// Top of the datasheet's rated range, which needs 1.15 V
-	vreg_set_voltage(VREG_VOLTAGE_1_15);
-	sleep_ms(10);
-	set_sys_clock_khz(200000, true);
-	// Setting the system clock moves the peripheral clock to the 48 MHz USB PLL, too slow for this SPI rate
-	clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS, 200 * MHZ, 200 * MHZ);
+	setupClocks(true);
 	stdio_init_all();
 	// Gives a serial monitor a moment to attach, so the startup messages aren't lost
 	for (int i = 0; i < 20 && !stdio_usb_connected(); i++) {
@@ -569,7 +564,7 @@ int main() {
 	s_spiHz = s_display.init(50000000);
 	s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, 0x0000);
 	multicore_launch_core1(core1Main);
-	printf("video player, %lux%lu screen, sys %lu MHz, SPI %u Hz\n", SCREEN_WIDTH, SCREEN_HEIGHT, clock_get_hz(clk_sys) / 1000000, s_spiHz);
+	printf("video player on %s, %lux%lu screen, sys %lu MHz, SPI %u Hz\n", CHIP_NAME, SCREEN_WIDTH, SCREEN_HEIGHT, clock_get_hz(clk_sys) / 1000000, s_spiHz);
 
 	s_stats.startUs = time_us_64();
 #if VIDEO_FROM_SD

@@ -1,4 +1,4 @@
-// Decode-only benchmark for the RP2040: no display and no audio output.
+// Decode-only benchmark for the RP2040 and RP2350: no display and no audio output.
 //
 // Decodes a clip embedded in flash as fast as possible, timing the video and audio decoders and measuring
 // memory. Then decodes it again hashing the output, to compare against a desktop decode of the same clip.
@@ -12,10 +12,10 @@
 
 #include <malloc.h>
 
+#include "Clocks.h"
 #include "hardware/clocks.h"
 #include "hardware/timer.h"
 #include "hardware/watchdog.h"
-#include "hardware/vreg.h"
 #include "pico/stdlib.h"
 
 #include "mpeg1/Mpeg1AudioDecoder.h"
@@ -327,21 +327,17 @@ int main() {
 	}
 	static repeating_timer_t heartbeatTimer;
 	add_repeating_timer_ms(5000, heartbeat, nullptr, &heartbeatTimer);
-	printf("\nmd_mpeg RP2040 benchmark, clip %u bytes\n", static_cast<unsigned>(clip_end - clip_start));
+	printf("\nmd_mpeg %s benchmark, clip %u bytes\n", CHIP_NAME, static_cast<unsigned>(clip_end - clip_start));
 
 	// Default clock
-	Result at125;
-	at125.sysClockKhz = clock_get_hz(clk_sys) / 1000;
-	printf("Decoding at %lu MHz...\n", at125.sysClockKhz / 1000);
+	Result atDefault;
+	atDefault.sysClockKhz = clock_get_hz(clk_sys) / 1000;
+	printf("Decoding at %lu MHz...\n", atDefault.sysClockKhz / 1000);
 	paintStack();
-	run(at125, false);
+	run(atDefault, false);
 	const auto stackBytes = stackUsed();
 
-	// Top of the datasheet's rated range, which needs 1.15 V
-	vreg_set_voltage(VREG_VOLTAGE_1_15);
-	sleep_ms(10);
-	const bool clockSet = set_sys_clock_khz(200000, false);
-	sleep_ms(10);
+	const bool clockSet = setupClocks(false);
 	Result at200;
 	if (clockSet) {
 		at200.sysClockKhz = clock_get_hz(clk_sys) / 1000;
@@ -354,14 +350,14 @@ int main() {
 	run(hashed, true);
 
 	for (;;) {
-		printf("\n==== md_mpeg RP2040 benchmark, clip %u bytes ====\n", static_cast<unsigned>(clip_end - clip_start));
-		printf("frames %lu, samples %llu, %lu Hz, %lu channels\n", at125.frames, at125.samples, at125.sampleRate, at125.channels);
-		printTiming(at125);
+		printf("\n==== md_mpeg %s benchmark, clip %u bytes ====\n", CHIP_NAME, static_cast<unsigned>(clip_end - clip_start));
+		printf("frames %lu, samples %llu, %lu Hz, %lu channels\n", atDefault.frames, atDefault.samples, atDefault.sampleRate, atDefault.channels);
+		printTiming(atDefault);
 		if (clockSet) {
 			printTiming(at200);
 		}
 		printf("memory: heap peak %lu bytes (%lu used after decode, %lu before main), stack %lu of %d bytes\n",
-		       at125.heapArena, at125.heapUsed, bootHeapUsed, stackBytes, PICO_STACK_SIZE);
+		       atDefault.heapArena, atDefault.heapUsed, bootHeapUsed, stackBytes, PICO_STACK_SIZE);
 		printf("output: video %016llx audio %016llx frames %lu samples %llu%s%s\n", hashed.videoHash, hashed.audioHash, hashed.frames, hashed.samples,
 		       *hashed.error ? " " : "", hashed.error);
 		printf("==== end ====\n");
