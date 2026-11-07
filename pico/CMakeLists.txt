@@ -40,7 +40,7 @@ function(add_decoder_app name main_source)
 		$<$<COMPILE_LANGUAGE:CXX>:-w>
 	)
 	set_property(SOURCE clip.S APPEND PROPERTY OBJECT_DEPENDS "${MD_MPEG_CLIP_DIR}/clip.mpg")
-	target_link_libraries(${name} PRIVATE pico_stdlib hardware_dma hardware_spi hardware_vreg hardware_watchdog)
+	target_link_libraries(${name} PRIVATE pico_stdlib pico_multicore hardware_dma hardware_spi hardware_vreg hardware_watchdog)
 	pico_enable_stdio_usb(${name} 1)
 	pico_enable_stdio_uart(${name} 0)
 	pico_add_extra_outputs(${name})
@@ -48,6 +48,8 @@ endfunction()
 
 add_decoder_app(benchmark_flash benchmark.cpp)
 add_decoder_app(video_player video_player.cpp)
+add_decoder_app(video_player_scaled video_player.cpp)
+target_compile_definitions(video_player_scaled PRIVATE VIDEO_SCALED=1)
 
 add_executable(display_test display_test.cpp)
 target_link_libraries(display_test PRIVATE pico_stdlib hardware_spi)

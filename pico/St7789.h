@@ -81,6 +81,8 @@ public:
 		const uint8_t memoryAccess = 0xA0; // Rows and columns exchanged, rows reversed: landscape
 		command(0x36, &memoryAccess, 1);
 		command(0x21); // Inversion on, IPS panels need it for correct colours
+		const uint8_t gammaCurve = 0x02; // Gamma 1.8, softer than the default 2.2
+		command(0x26, &gammaCurve, 1);
 		command(0x13); // Normal display mode
 		command(0x29); // Display on
 		sleep_ms(20);
@@ -108,19 +110,21 @@ public:
 		gpio_put(PIN_CS, true);
 	}
 
-	// Starts sending big-endian RGB565 pixels in the background. pixels must stay valid until waitForTransfer().
-	void startTransfer(const int x, const int y, const int width, const int height, const uint8_t *pixels) {
+	// Starts sending big-endian RGB565 pixels to a window, in pieces with sendPixels()
+	void beginPixels(const int x, const int y, const int width, const int height) {
 		setWindow(x, y, width, height);
 		gpio_put(PIN_CS, false);
 		gpio_put(PIN_DC, true);
-		dma_channel_transfer_from_buffer_now(m_dmaChannel, pixels, static_cast<uint32_t>(width) * height * 2);
 	}
 
-	[[nodiscard]] bool transferBusy() const {
-		return dma_channel_is_busy(m_dmaChannel);
+	// Waits for the previous piece, then sends this one in the background. pixels must stay valid until the
+	// next sendPixels() or endPixels() returns.
+	void sendPixels(const uint8_t *pixels, const uint32_t bytes) {
+		dma_channel_wait_for_finish_blocking(m_dmaChannel);
+		dma_channel_transfer_from_buffer_now(m_dmaChannel, pixels, bytes);
 	}
 
-	void waitForTransfer() {
+	void endPixels() {
 		dma_channel_wait_for_finish_blocking(m_dmaChannel);
 		while (spi_is_busy(spi0)) {
 		}

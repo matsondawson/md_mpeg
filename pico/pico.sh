@@ -2,7 +2,7 @@
 # RP2040 benchmark, everything runs in Docker.
 #
 #   pico/pico.sh build [clip.mpg]   Build the image and benchmark, embedding part of the clip.
-#   pico/pico.sh flash [target]     Flash benchmark_flash (default), video_player or display_test. The board must be connected.
+#   pico/pico.sh flash [target]     Flash benchmark_flash (default), video_player, video_player_scaled or display_test. The board must be connected.
 #   pico/pico.sh monitor [seconds]  Print the benchmark's USB serial output, default 180 s
 set -euo pipefail
 
