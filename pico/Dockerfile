@@ -4,7 +4,7 @@ FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	ca-certificates cmake coreutils g++ gcc gcc-arm-none-eabi git \
 	libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib libusb-1.0-0-dev \
-	ninja-build pkg-config python3 \
+	dosfstools mtools ninja-build pkg-config python3 \
 	&& rm -rf /var/lib/apt/lists/*
 
 ENV PICO_SDK_PATH=/opt/pico-sdk

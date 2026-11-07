@@ -2,7 +2,8 @@
 # RP2040 benchmark, everything runs in Docker.
 #
 #   pico/pico.sh build [clip.mpg]   Build the image and benchmark, embedding part of the clip.
-#   pico/pico.sh flash [target]     Flash benchmark_flash (default), video_player, video_player_scaled or display_test. The board must be connected.
+#   pico/pico.sh flash [target]     Flash benchmark_flash (default), video_player, video_player_scaled, video_player_sd or display_test. The board must be connected.
+#   pico/pico.sh test               Test the FAT32 code on the desktop, against generated disk images
 #   pico/pico.sh monitor [seconds]  Print the benchmark's USB serial output, default 180 s
 set -euo pipefail
 
@@ -28,6 +29,15 @@ case "${1:-}" in
 		in_docker cmake --build "$BUILD" 
 		in_docker arm-none-eabi-size "$BUILD/benchmark_flash.elf"
 		;;
+	test)
+		docker build -q -t "$IMAGE" "$ROOT/pico" > /dev/null
+		dir=$BUILD/fat32_test
+		rm -rf "${ROOT:?}/$dir"
+		mkdir -p "$ROOT/$dir"
+		in_docker pico/make_fat32_images.sh "$dir"
+		in_docker g++ -std=c++20 -O1 -g -Wall -Wextra -fsanitize=address,undefined -Ipico pico/fat32_test.cpp -o "$dir/fat32_test"
+		in_docker "$dir/fat32_test" "$dir"
+		;;
 	flash)
 				docker run --rm --privileged -v /dev/bus/usb:/dev/bus/usb -v "$ROOT:/src" -w /src "$IMAGE" \
 			picotool load -f -v -x "$BUILD/${2:-benchmark_flash}.uf2"
@@ -39,7 +49,7 @@ case "${1:-}" in
 			sh -c "stty -F $device raw -echo; timeout $seconds cat $device" || true
 		;;
 	*)
-		sed -n '2,6p' "$0"
+		sed -n '2,7p' "$0"
 		exit 1
 		;;
 esac

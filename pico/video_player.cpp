@@ -1,4 +1,7 @@
-// Plays the embedded clip's video on an ST7789V, looping. Audio is decoded but not played.
+// Plays video on an ST7789V, looping, from the embedded clip or from the first .MPG file in the root directory
+// of a FAT32 microSD card if built with VIDEO_FROM_SD. Audio is decoded but not played.
+//
+// With a card, the screen shows why nothing is playing: red for a card or filesystem problem, blue for no .MPG.
 //
 // Core 0 demuxes and decodes. When a frame is due, core 1 converts it to RGB565 one line at a time and sends
 // the lines by DMA, so the decoder keeps running and no frame buffer is needed. A displayed frame stays
@@ -11,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 
 #include "hardware/clocks.h"
@@ -24,8 +28,13 @@
 #include "mpeg1/Mpeg1VideoDecoder.h"
 #include "mpeg1/MpegProgramStream.h"
 
+#if VIDEO_FROM_SD
+#include "Fat32.h"
+#include "SdCard.h"
+#else
 extern "C" const uint8_t clip_start[];
 extern "C" const uint8_t clip_end[];
+#endif
 
 namespace {
 	constexpr uint32_t SOURCE_WIDTH = 160;
@@ -214,6 +223,57 @@ namespace {
 		}
 	}
 
+	// Bytes of input read, to notice playback stalling
+	uint32_t s_inputBytes = 0;
+
+#if VIDEO_FROM_SD
+	// Counts the time reading blocks the decoder
+	class TimedCard {
+		SdCard &m_card;
+
+	public:
+		uint32_t totalUs = 0;
+		uint32_t maxUs = 0;
+
+		explicit TimedCard(SdCard &card) : m_card(card) {
+		}
+
+		bool readSector(const uint32_t lba, uint8_t *buffer) {
+			const uint32_t start = time_us_32();
+			const bool ok = m_card.readSector(lba, buffer);
+			const uint32_t us = time_us_32() - start;
+			totalUs += us;
+			maxUs = std::max(maxUs, us);
+			return ok;
+		}
+	};
+
+	using Volume = Fat32<TimedCard>;
+
+	SdCard s_card;
+	TimedCard s_timedCard(s_card);
+	Volume s_volume(s_timedCard);
+
+	class CardFileStream final : public MStream::IReadByteStream {
+		Volume::File m_file;
+
+	public:
+		explicit CardFileStream(const Volume::Entry &entry) : m_file(s_volume, entry) {
+		}
+
+		uint8_t nextByte() override {
+			if (m_file.atEnd()) {
+				throw MStream::EndOfData();
+			}
+			s_inputBytes++;
+			return m_file.nextByte();
+		}
+
+		bool isEmpty() override {
+			return m_file.atEnd();
+		}
+	};
+#else
 	class ClipStream final : public MStream::IReadByteStream {
 		const uint8_t *m_position = clip_start;
 
@@ -222,6 +282,7 @@ namespace {
 			if (m_position == clip_end) {
 				throw MStream::EndOfData();
 			}
+			s_inputBytes++;
 			return *m_position++;
 		}
 
@@ -229,6 +290,7 @@ namespace {
 			return m_position == clip_end;
 		}
 	};
+#endif
 
 	struct Stats {
 		uint32_t shown = 0;
@@ -238,6 +300,9 @@ namespace {
 		uint32_t maxLateUs = 0;
 		uint32_t core1ConvertUs = 0;
 		uint32_t core1ScanUs = 0;
+#if VIDEO_FROM_SD
+		uint32_t cardUs = 0;
+#endif
 	};
 
 	Stats s_stats;
@@ -262,15 +327,23 @@ namespace {
 		       static_cast<double>(convertUs - s_stats.core1ConvertUs) / 1000.0 / s_stats.shown,
 		       static_cast<double>(scanUs - s_stats.core1ScanUs) / 1000.0 / s_stats.shown,
 		       s_core1MaxScanUs / 1000.0);
+#if VIDEO_FROM_SD
+		printf("  card reads %.1f%% of core 0, slowest %.1f ms\n",
+		       static_cast<double>(s_timedCard.totalUs - s_stats.cardUs) / elapsedUs * 100.0, s_timedCard.maxUs / 1000.0);
+		const uint32_t cardUs = s_timedCard.totalUs;
+		s_timedCard.maxUs = 0;
+#endif
 		s_stats = Stats{};
 		s_stats.startUs = now;
+#if VIDEO_FROM_SD
+		s_stats.cardUs = cardUs;
+#endif
 		s_stats.core1ConvertUs = convertUs;
 		s_stats.core1ScanUs = scanUs;
 		s_core1MaxScanUs = 0;
 	}
 
-	void playOnce() {
-		ClipStream clip;
+	void play(MStream::IReadByteStream &input) {
 		auto demuxer = std::make_unique<Mpeg1::MpegProgramStream>();
 		auto videoDecoder = std::make_unique<Mpeg1VideoDecoder>();
 		auto audioDecoder = std::make_unique<Mpeg1AudioDecoder>();
@@ -326,10 +399,21 @@ namespace {
 		});
 
 		try {
-			while (demuxer->nextPacket(clip) != Mpeg1::DemuxResult::EndOfStream) {
+			uint32_t lastInputBytes = s_inputBytes;
+			uint64_t lastProgressUs = time_us_64();
+			while (demuxer->nextPacket(input) != Mpeg1::DemuxResult::EndOfStream) {
 				// No audio output yet, so discard the samples
 				while (soundBuffer && !soundBuffer->isEmpty()) {
 					soundBuffer->nextByte();
+				}
+				// A picture too big for the video ring stops all input, for good
+				const uint64_t now = time_us_64();
+				if (s_inputBytes != lastInputBytes) {
+					lastInputBytes = s_inputBytes;
+					lastProgressUs = now;
+				} else if (now - lastProgressUs > 3000000) {
+					printf("Playback stalled, a picture may be bigger than the %d byte video ring\n", MD_MPEG_VIDEO_RING_SIZE);
+					break;
 				}
 			}
 		} catch (const std::exception &ex) {
@@ -352,6 +436,10 @@ int main() {
 	// Setting the system clock moves the peripheral clock to the 48 MHz USB PLL, too slow for this SPI rate
 	clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS, 200 * MHZ, 200 * MHZ);
 	stdio_init_all();
+	// Gives a serial monitor a moment to attach, so the startup messages aren't lost
+	for (int i = 0; i < 20 && !stdio_usb_connected(); i++) {
+		sleep_ms(100);
+	}
 
 	initTables();
 	s_spiHz = s_display.init(50000000);
@@ -360,8 +448,63 @@ int main() {
 	printf("video player, %lux%lu, sys %lu MHz, SPI %u Hz\n", OUTPUT_WIDTH, OUTPUT_HEIGHT, clock_get_hz(clk_sys) / 1000000, s_spiHz);
 
 	s_stats.startUs = time_us_64();
+#if VIDEO_FROM_SD
+	constexpr uint16_t COLOR_BLACK = 0x0000, COLOR_RED = 0xF800, COLOR_BLUE = 0x001F;
+	uint16_t screenColor = COLOR_BLACK;
+	const auto showStatus = [&](const uint16_t color) {
+		if (color != screenColor) {
+			screenColor = color;
+			s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, color);
+		}
+	};
+	const auto fail = [&](const char *message, const uint16_t color) {
+		printf("%s\n", message);
+		showStatus(color);
+		sleep_ms(1000);
+	};
+
 	for (;;) {
-		playOnce();
+		try {
+			if (const char *error = s_card.init()) {
+				fail(error, COLOR_RED);
+				continue;
+			}
+			const char *mountError = nullptr;
+			if (!s_volume.mount(mountError)) {
+				fail(mountError, COLOR_RED);
+				continue;
+			}
+
+			Volume::Entry video{};
+			bool found = false;
+			s_volume.forEachFile([&](const Volume::Entry &entry) {
+				printf("  %-12s %lu bytes\n", entry.name, entry.size);
+				const char *extension = strrchr(entry.name, '.');
+				if (!found && entry.size > 0 && extension && strcmp(extension, ".MPG") == 0) {
+					video = entry;
+					found = true;
+				}
+				return true;
+			});
+			if (!found) {
+				fail("No .MPG file in the root directory", COLOR_BLUE);
+				continue;
+			}
+
+			showStatus(COLOR_BLACK);
+			printf("Playing %s\n", video.name);
+			// On the heap, as the decoder's own stack use comes on top of this
+			auto stream = std::make_unique<CardFileStream>(video);
+			play(*stream);
+		} catch (const std::exception &ex) {
+			fail(ex.what(), COLOR_RED);
+		}
+	}
+#else
+	for (;;) {
+		ClipStream clip;
+		play(clip);
 		printf("clip finished, looping\n");
 	}
+#endif
 }

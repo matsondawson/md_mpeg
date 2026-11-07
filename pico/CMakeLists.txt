@@ -50,6 +50,8 @@ add_decoder_app(benchmark_flash benchmark.cpp)
 add_decoder_app(video_player video_player.cpp)
 add_decoder_app(video_player_scaled video_player.cpp)
 target_compile_definitions(video_player_scaled PRIVATE VIDEO_SCALED=1)
+add_decoder_app(video_player_sd video_player.cpp)
+target_compile_definitions(video_player_sd PRIVATE VIDEO_SCALED=1 VIDEO_FROM_SD=1)
 
 add_executable(display_test display_test.cpp)
 target_link_libraries(display_test PRIVATE pico_stdlib hardware_spi)
