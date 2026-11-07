@@ -66,7 +66,7 @@ static inline uint8_t clampToByte(int32_t n) {
 }
 
 // In-place 8x8 inverse DCT. block holds 64 premultiplied coefficients in raster order, and receives the samples.
-void video_idct(int *block) {
+void video_idct(int32_t *block) {
 	int b1, b3, b4, b6, b7, tmp1, tmp2, m0,
 			x0, x1, x2, x3, x4, y3, y4, y5, y6, y7;
 

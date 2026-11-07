@@ -183,9 +183,9 @@ void Mpeg1VideoDecoder::generateRgbFrameData(uint32_t *rgbData, const Frame &fra
 	// BT.601 limited range YCbCr to RGB, constants are Q16
 	const auto toRgb = [](const uint8_t luma, const int32_t r, const int32_t g, const int32_t b) -> uint32_t {
 		const int32_t y = (static_cast<int32_t>(luma) - 16) * 76309;
-		const uint32_t rr = std::clamp((y + r) >> 16, 0, 255);
-		const uint32_t gg = std::clamp((y - g) >> 16, 0, 255);
-		const uint32_t bb = std::clamp((y + b) >> 16, 0, 255);
+		const uint32_t rr = std::clamp<int32_t>((y + r) >> 16, 0, 255);
+		const uint32_t gg = std::clamp<int32_t>((y - g) >> 16, 0, 255);
+		const uint32_t bb = std::clamp<int32_t>((y + b) >> 16, 0, 255);
 		return (rr << 16) | (gg << 8) | bb;
 	};
 

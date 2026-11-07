@@ -18,4 +18,9 @@ using AudioSample = int16_t;
 using AudioSample = float;
 #endif
 
-using AudioSampleBuffer = MStream::RingBufferTyped<AudioSample, 32768>;
+// Samples of decoded audio buffered. Must hold more than one frame, override for small targets
+#ifndef MD_MPEG_SOUND_RING_SIZE
+#define MD_MPEG_SOUND_RING_SIZE 32768
+#endif
+
+using AudioSampleBuffer = MStream::RingBufferTyped<AudioSample, MD_MPEG_SOUND_RING_SIZE>;

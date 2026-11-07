@@ -8,6 +8,11 @@
 
 #include <functional>
 
+// Bytes of video buffered. Must hold the largest picture plus a start code, override for small targets
+#ifndef MD_MPEG_VIDEO_RING_SIZE
+#define MD_MPEG_VIDEO_RING_SIZE (256 * 1024)
+#endif
+
 static constexpr uint32_t PICTURE_START_CODE = 0x100;
 static constexpr uint32_t SLICE_START_CODE_START = 0x101;
 static constexpr uint32_t SLICE_START_CODE_END = 0x1AF;
@@ -37,7 +42,7 @@ class Mpeg1VideoDecoder final : public MStream::IWriteByteStream
 	std::function<void(const Frame &frame)> m_frameCallback;
 
 public:
-	MStream::RingBufferWithStartCodeEvent<256 * 1024, PICTURE_START_CODE> m_stream;
+	MStream::RingBufferWithStartCodeEvent<MD_MPEG_VIDEO_RING_SIZE, PICTURE_START_CODE> m_stream;
 private:
 	MStream::ReadBitStream m_bitStream;
 
