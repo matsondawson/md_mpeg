@@ -13,6 +13,11 @@
 #include "../stream/FileStream.h"
 #include "../stream/RingBufferWithStartCodeEvent.h"
 
+// Bytes of input buffered, override for small targets
+#ifndef MD_MPEG_DEMUX_RING_SIZE
+#define MD_MPEG_DEMUX_RING_SIZE 2048
+#endif
+
 namespace Mpeg1 {
 	customException(CorruptPacketException);
 
@@ -75,7 +80,7 @@ namespace Mpeg1 {
 	};
 
 	class MpegProgramStream {
-		MStream::RingBufferWithStartCodeEvent<2048> m_buffer;
+		MStream::RingBufferWithStartCodeEvent<MD_MPEG_DEMUX_RING_SIZE> m_buffer;
 
 		uint32_t m_bitCount, m_bitsLeft;
 		int32_t m_streamingPacketBytesRemaining;

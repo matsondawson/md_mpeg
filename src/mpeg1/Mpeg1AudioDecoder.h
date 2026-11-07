@@ -10,6 +10,11 @@
 
 #include <functional>
 
+// Bytes of audio buffered. Must hold the largest frame, override for small targets
+#ifndef MD_MPEG_AUDIO_RING_SIZE
+#define MD_MPEG_AUDIO_RING_SIZE (128 * 1024)
+#endif
+
 // Type of the values in the synthesis filter
 #if MD_MPEG_AUDIO_FIXED_POINT
 using audio_real_t = int32_t;
@@ -74,7 +79,7 @@ private:
 	// By channel, subband, part
 	uint8_t m_scale_factor[2][32][3]{0};
 	// By channel, subband, sample
-	int sample[2][32][3]{0};
+	int32_t sample[2][32][3]{0};
 
 	// Matrix transform output by channel, a ring of 16 blocks of 64
 	audio_real_t V[2][1024]{0};
@@ -82,7 +87,7 @@ private:
 	audio_real_t U[32]{0};
 
 public:
-	MStream::RingBufferWithSizeEvent<128*1024> m_stream;
+	MStream::RingBufferWithSizeEvent<MD_MPEG_AUDIO_RING_SIZE> m_stream;
 private:
 	MStream::ReadBitStream m_bitStream;
 

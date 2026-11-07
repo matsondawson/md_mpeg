@@ -66,7 +66,7 @@ static inline uint8_t clampToByte(int32_t n) {
 }
 
 // In-place 8x8 inverse DCT. block holds 64 premultiplied coefficients in raster order, and receives the samples.
-void video_idct(int *block) {
+void video_idct(int32_t *block) {
 	int b1, b3, b4, b6, b7, tmp1, tmp2, m0,
 			x0, x1, x2, x3, x4, y3, y4, y5, y6, y7;
 
@@ -143,11 +143,14 @@ Frame::~Frame() {
 
 void Frame::init(const int32_t ptsMillis, const FrameSize frameSize) {
 	if (frameSize != m_frameSize) {
+		// Cleared before allocating, so a failed allocation leaves nothing freed twice
 		delete[] m_yData;
-		m_yData = new uint8_t[frameSize.luma_width * frameSize.luma_height]();
 		delete[] m_crData;
-		m_crData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		delete[] m_cbData;
+		m_yData = m_crData = m_cbData = nullptr;
+		m_frameSize = {};
+		m_yData = new uint8_t[frameSize.luma_width * frameSize.luma_height]();
+		m_crData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		m_cbData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		m_frameSize = frameSize;
 	}

@@ -572,7 +572,7 @@ void Mpeg1AudioDecoder::audio_read_samples(const int ch, const int sb, const int
 }
 
 // 32-point matrix transform. s: subband samples, ss: sample index 0..2, d: V, dp: write position, 64 values written.
-void audio_matrix_transform(int s[32][3], int ss, audio_real_t *d, int dp) {
+void audio_matrix_transform(int32_t s[32][3], int ss, audio_real_t *d, int dp) {
     audio_real_t t01, t02, t03, t04, t05, t06, t07, t08, t09, t10, t11, t12,
             t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24,
             t25, t26, t27, t28, t29, t30, t31, t32, t33;
