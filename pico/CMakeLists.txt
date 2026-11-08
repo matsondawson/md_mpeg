@@ -17,6 +17,7 @@ pico_sdk_init()
 
 set(MD_MPEG_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(MD_MPEG_CLIP_DIR "" CACHE PATH "Directory holding clip.mpg, the clip to embed")
+option(MD_MPEG_SPARSE_IDCT "Skip the IDCT arithmetic for rows and columns with only a first coefficient" ON)
 
 # The video ring holds the largest picture. Measured peaks: termaudio 9049 bytes, a 140x120 variable bit
 # rate file 10378 (its header declared 6 KB, so headers can't be trusted for this). The RP2350's 520 KB of
@@ -39,6 +40,7 @@ function(add_decoder_app name main_source)
 	target_include_directories(${name} PRIVATE "${MD_MPEG_SRC}" "${MD_MPEG_SRC}/stream" "${MD_MPEG_SRC}/mpeg1")
 	target_compile_definitions(${name} PRIVATE
 		MD_MPEG_AUDIO_FIXED_POINT=1
+		MD_MPEG_SPARSE_IDCT=$<BOOL:${MD_MPEG_SPARSE_IDCT}>
 		MD_MPEG_DEMUX_RING_SIZE=512
 		MD_MPEG_VIDEO_RING_SIZE=${MD_MPEG_PICO_VIDEO_RING_SIZE}
 		MD_MPEG_AUDIO_RING_SIZE=384

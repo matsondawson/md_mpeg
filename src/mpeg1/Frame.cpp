@@ -66,6 +66,13 @@ static inline uint8_t clampToByte(int32_t n) {
 	return (n > 255) ? 255 : (n < 0) ? 0 : n;
 }
 
+// Skip the arithmetic for columns and rows whose only non-zero coefficient is the first. Most are like that,
+// and the result is the same: such a column transforms to its first value in every row, and such a row to
+// (first + 128) >> 8 in every column.
+#ifndef MD_MPEG_SPARSE_IDCT
+#define MD_MPEG_SPARSE_IDCT 1
+#endif
+
 // In-place 8x8 inverse DCT. block holds 64 premultiplied coefficients in raster order, and receives the samples.
 void video_idct(int32_t *block) {
 	int b1, b3, b4, b6, b7, tmp1, tmp2, m0,
@@ -73,6 +80,18 @@ void video_idct(int32_t *block) {
 
 	// Transform columns
 	for (int i = 0; i < 8; ++i) {
+#if MD_MPEG_SPARSE_IDCT
+		if ((block[1 * 8 + i] | block[2 * 8 + i] | block[3 * 8 + i] | block[4 * 8 + i] | block[5 * 8 + i] |
+		     block[6 * 8 + i] | block[7 * 8 + i]) == 0) {
+			const int32_t dc = block[i];
+			if (dc != 0) {
+				for (int row = 1; row < 8; row++) {
+					block[row * 8 + i] = dc;
+				}
+			}
+			continue;
+		}
+#endif
 		b1 = block[4 * 8 + i];
 		b3 = block[2 * 8 + i] + block[6 * 8 + i];
 		b4 = block[5 * 8 + i] - block[3 * 8 + i];
@@ -103,6 +122,16 @@ void video_idct(int32_t *block) {
 
 	// Transform rows
 	for (int i = 0; i < 64; i += 8) {
+#if MD_MPEG_SPARSE_IDCT
+		if ((block[1 + i] | block[2 + i] | block[3 + i] | block[4 + i] | block[5 + i] | block[6 + i] |
+		     block[7 + i]) == 0) {
+			const int32_t value = (block[i] + 128) >> 8;
+			for (int column = 0; column < 8; column++) {
+				block[column + i] = value;
+			}
+			continue;
+		}
+#endif
 		b1 = block[4 + i];
 		b3 = block[2 + i] + block[6 + i];
 		b4 = block[5 + i] - block[3 + i];
