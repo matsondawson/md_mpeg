@@ -16,9 +16,10 @@ class SdCard {
 	static constexpr uint PIN_CS = 13;
 
 	static constexpr uint32_t INIT_HZ = 400000;
-	// Well above what the video needs, and tolerant of jumper wires. SPI mode has no CRC checks by default,
-	// so a slower clock is the protection against corrupt reads.
-	static constexpr uint32_t READ_HZ = 12500000;
+	// The most a card has to support before switching to high speed mode. SPI mode has no CRC checks by
+	// default, so a clock the wiring can carry is the protection against corrupt reads. Tested on jumper wires:
+	// 25 and 33 MHz read 8184 sectors with no CRC errors, 50 MHz failed every read.
+	static constexpr uint32_t READ_HZ = 25000000;
 
 	static constexpr uint8_t CMD0_GO_IDLE = 0;
 	static constexpr uint8_t CMD8_SEND_IF_COND = 8;
