@@ -2,6 +2,7 @@
 
 #include "Mpeg1VideoDecoder.h"
 #include "../mpeg1/Frame.h"
+#include "PixelWords.h"
 
 #include <cstring>
 
@@ -428,76 +429,90 @@ void Mpeg1VideoDecoder::videoInterpolateMacroblock(const int motion_h, const int
 		DEST_INDEX += dest_scan; \
 	}}
 
-// ReSharper disable once CppMemberFunctionMayBeConst
-void Mpeg1VideoDecoder::videoProcessMacroblock(uint8_t *d, const uint8_t *s, const int motion_h, const int motion_v,
-                                               const uint32_t block_size) const {
-	const uint32_t dw = m_macroblockWidth * block_size;
-
-	const int32_t hp = motion_h >> 1, vp = motion_v >> 1;
-	uint32_t si = ((mb_row * block_size) + vp) * dw + (mb_col * block_size) + hp;
-	uint32_t di = (mb_row * dw + mb_col) * block_size;
-
-	const uint32_t max_address = (dw * (m_macroblockHeight * block_size - block_size + 1) - block_size);
-	if (si > max_address || di > max_address) {
-		// Motion vector points outside the frame (corrupt data), leave the block as it is
-		debug_out << "Motion vector out of range" << std::endl;
-		return;
-	}
-
-	const auto odd_h = (motion_h & 1) << 1, odd_v = (motion_v & 1);
-	// Half pel flags: odd_h | odd_v is always 0..3
-	// ReSharper disable once CppDefaultCaseNotHandledInSwitchStatement
-	switch (odd_h | odd_v) {
-		case 0:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (s[si]));
-			break;
-		case 1:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (s[si] + s[si + dw] + 1) >> 1);
-			break;
-		case 2:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (s[si] + s[si + 1] + 1) >> 1);
-			break;
-		case 3:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (s[si] + s[si + 1] + s[si + dw] + s[si + dw + 1] + 2) >> 2);
-			break;
+// Predicts one SIZE x SIZE block from s into d, a word at a time. HALF_PEL is the half pel flags, horizontal in
+// bit 1 and vertical in bit 0. INTERPOLATE averages the prediction with what d already holds.
+template <uint32_t SIZE, uint32_t HALF_PEL, bool INTERPOLATE>
+static void videoPredictBlock(uint8_t *d, const uint8_t *s, const uint32_t dw) {
+	constexpr int WORDS = SIZE / 4;
+	for (uint32_t y = 0; y < SIZE; y++) {
+		uint32_t row[WORDS];
+		if constexpr (HALF_PEL == 0) {
+			PixelWords::loadRow<WORDS>(s, row);
+		} else if constexpr (HALF_PEL == 3) {
+			uint32_t right[WORDS], below[WORDS], belowRight[WORDS];
+			PixelWords::loadRow<WORDS>(s, row);
+			PixelWords::loadRow<WORDS>(s + 1, right);
+			PixelWords::loadRow<WORDS>(s + dw, below);
+			PixelWords::loadRow<WORDS>(s + dw + 1, belowRight);
+			for (int i = 0; i < WORDS; i++) {
+				row[i] = PixelWords::average4(row[i], right[i], below[i], belowRight[i]);
+			}
+		} else {
+			uint32_t other[WORDS];
+			PixelWords::loadRow<WORDS>(s, row);
+			PixelWords::loadRow<WORDS>(HALF_PEL == 1 ? s + dw : s + 1, other);
+			for (int i = 0; i < WORDS; i++) {
+				row[i] = PixelWords::average2(row[i], other[i]);
+			}
+		}
+		for (int i = 0; i < WORDS; i++) {
+			uint32_t value = row[i];
+			if constexpr (INTERPOLATE) {
+				value = PixelWords::average2(PixelWords::loadAligned(d + 4 * i), value);
+			}
+			PixelWords::storeAligned(d + 4 * i, value);
+		}
+		s += dw;
+		d += dw;
 	}
 }
 
-// ReSharper disable once CppMemberFunctionMayBeConst
-void Mpeg1VideoDecoder::videoProcessMacroblockInterpolate(uint8_t *d, const uint8_t *s, const int motion_h, const int motion_v,
-                                                          const uint32_t block_size) const {
-	const uint32_t dw = m_macroblockWidth * block_size;
+template <uint32_t SIZE, bool INTERPOLATE>
+static void videoPredictBlock(uint8_t *d, const uint8_t *s, const uint32_t dw, const uint32_t halfPel) {
+	// halfPel is always 0..3
+	switch (halfPel) {
+		case 0: videoPredictBlock<SIZE, 0, INTERPOLATE>(d, s, dw); break;
+		case 1: videoPredictBlock<SIZE, 1, INTERPOLATE>(d, s, dw); break;
+		case 2: videoPredictBlock<SIZE, 2, INTERPOLATE>(d, s, dw); break;
+		default: videoPredictBlock<SIZE, 3, INTERPOLATE>(d, s, dw); break;
+	}
+}
 
-	const int32_t hp = motion_h >> 1;
-	const int32_t vp = motion_v >> 1;
-	uint32_t si = ((mb_row * block_size) + vp) * dw + (mb_col * block_size) + hp;
-	uint32_t di = (mb_row * dw + mb_col) * block_size;
+// One plane of a macroblock's prediction. d starts at a multiple of 8 pixels in a plane whose width is a
+// multiple of 8, so its rows are word aligned.
+template <bool INTERPOLATE>
+static void videoPredictPlane(uint8_t *d, const uint8_t *s, const uint32_t mb_row, const uint32_t mb_col,
+                              const uint32_t macroblockWidth, const uint32_t macroblockHeight, const int motion_h,
+                              const int motion_v, const uint32_t block_size) {
+	const uint32_t dw = macroblockWidth * block_size;
 
-	uint32_t max_address = (dw * (m_macroblockHeight * block_size - block_size + 1) - block_size);
+	const int32_t hp = motion_h >> 1, vp = motion_v >> 1;
+	const uint32_t si = ((mb_row * block_size) + vp) * dw + (mb_col * block_size) + hp;
+	const uint32_t di = (mb_row * dw + mb_col) * block_size;
+
+	const uint32_t max_address = (dw * (macroblockHeight * block_size - block_size + 1) - block_size);
 	if (si > max_address || di > max_address) {
 		// Motion vector points outside the frame (corrupt data), leave the block as it is
 		debug_out << "Motion vector out of range" << std::endl;
 		return;
 	}
 
-	const auto odd_h = (motion_h & 1) << 1, odd_v = (motion_v & 1);
-
-	// ReSharper disable once CppDefaultCaseNotHandledInSwitchStatement
-	switch (odd_h | odd_v) {
-		case 0:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (d[di] + (s[si]) + 1) >> 1);
-			break;
-		case 1:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (d[di] + ((s[si] + s[si + dw] + 1) >> 1) + 1) >> 1);
-			break;
-		case 2:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (d[di] + ((s[si] + s[si + 1] + 1) >> 1) + 1) >> 1);
-			break;
-		case 3:
-			BLOCK_SET(d, di, dw, si, dw, block_size,
-			              (d[di] + ((s[si] + s[si + 1] + s[si + dw] + s[si + dw + 1] + 2) >> 2) + 1) >> 1);
-			break;
+	const uint32_t halfPel = ((motion_h & 1) << 1) | (motion_v & 1);
+	if (block_size == 16) {
+		videoPredictBlock<16, INTERPOLATE>(d + di, s + si, dw, halfPel);
+	} else {
+		videoPredictBlock<8, INTERPOLATE>(d + di, s + si, dw, halfPel);
 	}
+}
+
+void Mpeg1VideoDecoder::videoProcessMacroblock(uint8_t *d, const uint8_t *s, const int motion_h, const int motion_v,
+                                               const uint32_t block_size) const {
+	videoPredictPlane<false>(d, s, mb_row, mb_col, m_macroblockWidth, m_macroblockHeight, motion_h, motion_v, block_size);
+}
+
+void Mpeg1VideoDecoder::videoProcessMacroblockInterpolate(uint8_t *d, const uint8_t *s, const int motion_h, const int motion_v,
+                                                          const uint32_t block_size) const {
+	videoPredictPlane<true>(d, s, mb_row, mb_col, m_macroblockWidth, m_macroblockHeight, motion_h, motion_v, block_size);
 }
 
 
