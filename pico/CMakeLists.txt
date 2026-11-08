@@ -18,6 +18,8 @@ pico_sdk_init()
 set(MD_MPEG_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(MD_MPEG_CLIP_DIR "" CACHE PATH "Directory holding clip.mpg, the clip to embed")
 option(MD_MPEG_SPARSE_IDCT "Skip the IDCT arithmetic for rows and columns with only a first coefficient" ON)
+# The Pico's audio output is mono
+option(MD_MPEG_AUDIO_MONO "Mix stereo audio to mono before the synthesis filter, halving its work" ON)
 
 # The video ring holds the largest picture. Measured peaks: termaudio 9049 bytes, a 140x120 variable bit
 # rate file 10378 (its header declared 6 KB, so headers can't be trusted for this). The RP2350's 520 KB of
@@ -41,6 +43,7 @@ function(add_decoder_app name main_source)
 	target_compile_definitions(${name} PRIVATE
 		MD_MPEG_AUDIO_FIXED_POINT=1
 		MD_MPEG_SPARSE_IDCT=$<BOOL:${MD_MPEG_SPARSE_IDCT}>
+		MD_MPEG_AUDIO_MONO=$<BOOL:${MD_MPEG_AUDIO_MONO}>
 		MD_MPEG_DEMUX_RING_SIZE=512
 		MD_MPEG_VIDEO_RING_SIZE=${MD_MPEG_PICO_VIDEO_RING_SIZE}
 		MD_MPEG_AUDIO_RING_SIZE=384
@@ -61,9 +64,17 @@ function(add_decoder_app name main_source)
 endfunction()
 
 add_decoder_app(benchmark_flash benchmark.cpp)
+option(MD_MPEG_PICO_AUDIO_ON_CORE1 "Decode audio on core 1, between frame scans, instead of on core 0" ON)
 add_decoder_app(video_player video_player.cpp)
 add_decoder_app(video_player_sd video_player.cpp)
 target_compile_definitions(video_player_sd PRIVATE VIDEO_FROM_SD=1)
+foreach(player video_player video_player_sd)
+	target_compile_definitions(${player} PRIVATE
+		VIDEO_AUDIO_ON_CORE1=$<BOOL:${MD_MPEG_PICO_AUDIO_ON_CORE1}>
+		# Core 1 would otherwise compete with core 0 for the flash cache
+		MD_MPEG_AUDIO_IN_RAM=$<BOOL:${MD_MPEG_PICO_AUDIO_ON_CORE1}>
+	)
+endforeach()
 
 add_executable(display_test display_test.cpp)
 target_link_libraries(display_test PRIVATE pico_stdlib hardware_spi)

@@ -273,7 +273,8 @@ static void testVideoOnly() {
 	CHECK(p->audioValues == 0);
 }
 
-// The decoded waveform, including its level and polarity, must match ffmpeg's decode
+// The decoded waveform, including its level and polarity, must match ffmpeg's decode. With MD_MPEG_AUDIO_MONO
+// a stereo clip must match the average of ffmpeg's two channels.
 static constexpr double MIN_SNR_DB = 55.0;
 
 static void checkAudioMatchesFfmpeg(const fs::path &clip, const std::string &referenceName, const uint32_t channels) {
@@ -284,22 +285,28 @@ static void checkAudioMatchesFfmpeg(const fs::path &clip, const std::string &ref
 	const auto bytes = readFile(reference);
 	const auto p = decode(clip);
 	CHECK(p->finished);
-	CHECK(p->audioChannels == channels);
+	const bool mixed = MD_MPEG_AUDIO_MONO && channels == 2;
+	CHECK(p->audioChannels == (mixed ? 1 : channels));
 	CHECK(bytes.size() >= 2);
 
+	const auto referenceSample = [&bytes](const size_t i) {
+		return static_cast<double>(static_cast<int16_t>(bytes[i * 2] | (bytes[i * 2 + 1] << 8)));
+	};
+	// Reference samples per decoded sample
+	const size_t step = mixed ? 2 : 1;
 	// Interleave to match the reference
-	const size_t count = std::min(p->audioSamples.size() - p->audioSamples.size() % 64, bytes.size() / 2);
-	CHECK_RANGE(static_cast<double>(count) / static_cast<double>(bytes.size() / 2), 0.99, 1.01);
+	const size_t count = std::min(p->audioSamples.size() - p->audioSamples.size() % 64, bytes.size() / 2 / step);
+	CHECK_RANGE(static_cast<double>(count * step) / static_cast<double>(bytes.size() / 2), 0.99, 1.01);
 	const double toS16 = MD_MPEG_AUDIO_FIXED_POINT ? 1.0 : 32768.0;
 	double sumReference = 0, sumError = 0;
 	for (size_t i = 0; i < count; i++) {
 		size_t decodedIndex = i;
-		if (channels == 2) {
+		if (channels == 2 && !mixed) {
 			const size_t frame = i / 2;
 			decodedIndex = frame / 32 * 64 + (i & 1) * 32 + frame % 32;
 		}
 		const double decoded = p->audioSamples[decodedIndex] * toS16;
-		const double expected = static_cast<int16_t>(bytes[i * 2] | (bytes[i * 2 + 1] << 8));
+		const double expected = mixed ? (referenceSample(2 * i) + referenceSample(2 * i + 1)) / 2 : referenceSample(i);
 		sumReference += expected * expected;
 		sumError += (decoded - expected) * (decoded - expected);
 	}

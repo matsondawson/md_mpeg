@@ -15,6 +15,14 @@
 #define MD_MPEG_AUDIO_RING_SIZE (128 * 1024)
 #endif
 
+// 1: mixes stereo to mono before the synthesis filter, so output is always one channel. The filter is linear,
+// so this is the average of the two channels' output, to within rounding, for half the synthesis work and half
+// the filter's memory. Set it with the CMake option of the same name, it must be the same for everything that
+// uses the decoder.
+#ifndef MD_MPEG_AUDIO_MONO
+#define MD_MPEG_AUDIO_MONO 0
+#endif
+
 // Type of the values in the synthesis filter
 #if MD_MPEG_AUDIO_FIXED_POINT
 using audio_real_t = int32_t;
@@ -81,9 +89,12 @@ private:
 	// By channel, subband, sample
 	int32_t sample[2][32][3]{0};
 
+	// Channels the synthesis filter runs for
+	static constexpr int SYNTHESIS_CHANNELS = MD_MPEG_AUDIO_MONO ? 1 : 2;
+
 	// Matrix transform output by channel, a ring of 16 blocks. Each block keeps 32 of its 64 values, the others
 	// mirror them (see audioWindowFirstHalf).
-	audio_real_t V[2][512]{0};
+	audio_real_t V[SYNTHESIS_CHANNELS][512]{0};
 	// Windowed output of one 32-sample block
 	audio_real_t U[32]{0};
 
@@ -102,6 +113,7 @@ public:
 	static constexpr uint32_t SAMPLES_PER_FRAME = 1152;
 
 	[[nodiscard]] int32_t firstFramePtsMillis() const { return m_firstFramePtsMillis; }
+	// Channels in the output
 	[[nodiscard]] uint32_t channels() const;
 	// A complete frame is buffered, waiting for space in the sound buffer
 	[[nodiscard]] bool hasPendingFrame();

@@ -1,5 +1,6 @@
 // Plays video on an ST7789V, looping, from the embedded clip or from the .MPG files in the root directory
-// of a FAT32 microSD card if built with VIDEO_FROM_SD. Audio is decoded but not played.
+// of a FAT32 microSD card if built with VIDEO_FROM_SD. Audio is decoded but not played, on core 1 between frame
+// scans if built with VIDEO_AUDIO_ON_CORE1, otherwise on core 0 with the video.
 //
 // With a card, the first .MPG plays, looping, and a button from GP15 to ground moves to the next one.
 // The screen shows why nothing is playing: red for a card or filesystem problem, blue for no .MPG, and
@@ -298,8 +299,177 @@ namespace {
 		}
 	}
 
+#if VIDEO_AUDIO_ON_CORE1
+	// Compressed audio from the demuxer on core 0 to the audio decoder on core 1, with the stream's PTS marks.
+	// One writer, one reader. Positions count bytes since the last reset and are never wrapped.
+	class AudioPipe final : public MStream::IWriteByteStream {
+		// Holds the audio arriving during a frame scan, when core 1 can't take it, with plenty to spare.
+		// A power of 2.
+		static constexpr uint32_t SIZE = 4096;
+		static constexpr uint32_t PTS_SIZE = 16;
+
+		struct PtsMark {
+			// Where in the bytes the PTS applies
+			uint32_t position;
+			int32_t ptsMillis;
+		};
+
+		uint8_t m_bytes[SIZE];
+		PtsMark m_marks[PTS_SIZE];
+		std::atomic<uint32_t> m_written{0}, m_read{0};
+		std::atomic<uint32_t> m_marksWritten{0}, m_marksRead{0};
+
+	public:
+		// Core 0, only while core 1 isn't reading
+		void reset() {
+			m_written.store(0, std::memory_order_relaxed);
+			m_read.store(0, std::memory_order_relaxed);
+			m_marksWritten.store(0, std::memory_order_relaxed);
+			m_marksRead.store(0, std::memory_order_release);
+		}
+
+		// IWriteByteStream, for the demuxer on core 0
+
+		// Only the decoder knows its frames' times
+		int32_t getPts(int32_t) override {
+			return -1;
+		}
+
+		void setPts(const int32_t ptsMillis) override {
+			const uint32_t marks = m_marksWritten.load(std::memory_order_relaxed);
+			// A PTS comes with each audio packet, so the marks can only fill if the bytes are full too
+			if (marks - m_marksRead.load(std::memory_order_acquire) < PTS_SIZE) {
+				m_marks[marks % PTS_SIZE] = {m_written.load(std::memory_order_relaxed), ptsMillis};
+				m_marksWritten.store(marks + 1, std::memory_order_release);
+			}
+		}
+
+		void writeByte(const uint8_t data) override {
+			const uint32_t written = m_written.load(std::memory_order_relaxed);
+			m_bytes[written % SIZE] = data;
+			m_written.store(written + 1, std::memory_order_release);
+		}
+
+		[[nodiscard]] bool isFull() override {
+			return m_written.load(std::memory_order_relaxed) - m_read.load(std::memory_order_acquire) >= SIZE;
+		}
+
+		// Core 1 decodes
+		void executeCallbacks() override {
+		}
+
+		void flush() override {
+		}
+
+		// Core 1
+
+		[[nodiscard]] bool isEmptyForReader() const {
+			return m_read.load(std::memory_order_relaxed) == m_written.load(std::memory_order_acquire);
+		}
+
+		void discard() {
+			m_marksRead.store(m_marksWritten.load(std::memory_order_acquire), std::memory_order_release);
+			m_read.store(m_written.load(std::memory_order_acquire), std::memory_order_release);
+		}
+
+		// Feeds the decoder, decoding at most one frame, so a frame scan never waits for more than one
+		void feed(Mpeg1AudioDecoder &decoder) {
+			uint32_t read = m_read.load(std::memory_order_relaxed);
+			uint32_t marksRead = m_marksRead.load(std::memory_order_relaxed);
+			const uint32_t written = m_written.load(std::memory_order_acquire);
+			const uint32_t marksWritten = m_marksWritten.load(std::memory_order_acquire);
+			bool decoded = false;
+			while (read != written) {
+				if (decoder.isFull()) {
+					if (decoded) {
+						return;
+					}
+					decoder.executeCallbacks();
+					decoded = true;
+					if (decoder.isFull()) {
+						return;
+					}
+				}
+				while (marksRead != marksWritten && m_marks[marksRead % PTS_SIZE].position == read) {
+					decoder.setPts(m_marks[marksRead % PTS_SIZE].ptsMillis);
+					marksRead++;
+				}
+				decoder.writeByte(m_bytes[read % SIZE]);
+				read++;
+				// Frees space as it goes, so core 0 isn't held up by a long run of decoding
+				m_marksRead.store(marksRead, std::memory_order_release);
+				m_read.store(read, std::memory_order_release);
+			}
+			if (!decoded) {
+				decoder.executeCallbacks();
+			}
+		}
+	};
+
+	AudioPipe s_audioPipe;
+	// The decoder core 1 feeds, null while there's none. Core 0 sets it, and waits for core 1 not to be busy
+	// with it before the decoder goes.
+	std::atomic<Mpeg1AudioDecoder *> s_core1AudioDecoder{nullptr};
+	std::atomic<bool> s_core1AudioBusy{false};
+	// Core 1 stops decoding, and discards the audio, after the decoder throws
+	bool s_core1AudioFailed = false;
+	volatile uint32_t s_core1AudioUs = 0;
+	volatile bool s_core1AudioFailedReport = false;
+
+	void __not_in_flash_func(core1Audio)() {
+		if (s_audioPipe.isEmptyForReader()) {
+			return;
+		}
+		// Sequentially consistent with core 0's detach, so either core 0 sees core 1 busy or core 1 sees null
+		s_core1AudioBusy.store(true);
+		if (Mpeg1AudioDecoder *decoder = s_core1AudioDecoder.load()) {
+			if (s_core1AudioFailed) {
+				s_audioPipe.discard();
+			} else {
+				const uint32_t start = time_us_32();
+				try {
+					s_audioPipe.feed(*decoder);
+				} catch (const std::exception &) {
+					s_core1AudioFailed = true;
+					s_core1AudioFailedReport = true;
+					s_audioPipe.discard();
+				}
+				s_core1AudioUs = s_core1AudioUs + (time_us_32() - start);
+			}
+		}
+		s_core1AudioBusy.store(false);
+	}
+
+	// Hands a decoder to core 1 for as long as this lives
+	class Core1Audio {
+	public:
+		explicit Core1Audio(Mpeg1AudioDecoder &decoder) {
+			s_audioPipe.reset();
+			s_core1AudioFailed = false;
+			s_core1AudioDecoder.store(&decoder);
+		}
+
+		~Core1Audio() {
+			s_core1AudioDecoder.store(nullptr);
+			while (s_core1AudioBusy.load()) {
+				tight_loop_contents();
+			}
+		}
+
+		Core1Audio(const Core1Audio &) = delete;
+		Core1Audio &operator=(const Core1Audio &) = delete;
+	};
+#endif
+
 	void __not_in_flash_func(core1Main)() {
 		for (;;) {
+#if VIDEO_AUDIO_ON_CORE1
+			// Audio between scans. A scan waits for any audio frame being decoded.
+			if (!multicore_fifo_rvalid()) {
+				core1Audio();
+				continue;
+			}
+#endif
 			const auto *frame = reinterpret_cast<const Frame *>(multicore_fifo_pop_blocking());
 			scanFrame(*frame);
 			s_scanBusy.store(false, std::memory_order_release);
@@ -386,6 +556,9 @@ namespace {
 		uint32_t maxLateUs = 0;
 		uint32_t core1ConvertUs = 0;
 		uint32_t core1ScanUs = 0;
+#if VIDEO_AUDIO_ON_CORE1
+		uint32_t core1AudioUs = 0;
+#endif
 #if VIDEO_FROM_SD
 		uint32_t cardUs = 0;
 #endif
@@ -415,6 +588,12 @@ namespace {
 		       static_cast<double>(convertUs - s_stats.core1ConvertUs) / 1000.0 / s_stats.shown,
 		       static_cast<double>(scanUs - s_stats.core1ScanUs) / 1000.0 / s_stats.shown,
 		       s_core1MaxScanUs / 1000.0);
+#if VIDEO_AUDIO_ON_CORE1
+		const uint32_t audioUs = s_core1AudioUs;
+		printf("  audio %.1f%% of core 1%s\n", static_cast<double>(audioUs - s_stats.core1AudioUs) / elapsedUs * 100.0,
+		       s_core1AudioFailedReport ? ", stopped after a decoder error" : "");
+		s_core1AudioFailedReport = false;
+#endif
 #if VIDEO_FROM_SD
 		printf("  card reads %.1f%% of core 0, slowest %.1f ms\n",
 		       static_cast<double>(s_timedCard.totalUs - s_stats.cardUs) / elapsedUs * 100.0, s_timedCard.maxUs / 1000.0);
@@ -429,6 +608,9 @@ namespace {
 #endif
 		s_stats.core1ConvertUs = convertUs;
 		s_stats.core1ScanUs = scanUs;
+#if VIDEO_AUDIO_ON_CORE1
+		s_stats.core1AudioUs = audioUs;
+#endif
 		s_core1MaxScanUs = 0;
 	}
 
@@ -448,10 +630,21 @@ namespace {
 		auto videoDecoder = std::make_unique<Mpeg1VideoDecoder>();
 		auto audioDecoder = std::make_unique<Mpeg1AudioDecoder>();
 		demuxer->setVideoDecoder(videoDecoder.get());
+		// No audio output yet, so the samples are discarded
+		audioDecoder->setFrameCallback([](uint32_t, uint32_t, AudioSampleBuffer *buffer) {
+			while (!buffer->isEmpty()) {
+				buffer->nextByte();
+			}
+		});
+#if VIDEO_AUDIO_ON_CORE1
+		// Goes before the decoder does
+		Core1Audio core1Audio(*audioDecoder);
+		demuxer->setAudioDecoder(&s_audioPipe);
+#else
 		demuxer->setAudioDecoder(audioDecoder.get());
+#endif
 
 		DisplayTimestamper timestamper;
-		AudioSampleBuffer *soundBuffer = nullptr;
 		bool timelineStarted = false;
 		uint64_t timelineStartUs = 0;
 
@@ -503,19 +696,11 @@ namespace {
 				report();
 			}
 		});
-		audioDecoder->setFrameCallback([&](uint32_t, uint32_t, AudioSampleBuffer *buffer) {
-			soundBuffer = buffer;
-		});
-
 		try {
 			uint32_t lastInputBytes = s_inputBytes;
 			uint64_t lastProgressUs = time_us_64();
 			while (demuxer->nextPacket(input) != Mpeg1::DemuxResult::EndOfStream) {
 				s_videoRingPeak = std::max(s_videoRingPeak, videoDecoder->m_stream.used());
-				// No audio output yet, so discard the samples
-				while (soundBuffer && !soundBuffer->isEmpty()) {
-					soundBuffer->nextByte();
-				}
 #if VIDEO_FROM_SD
 				if (s_nextButton.pressed()) {
 					result = PlayEnd::NextRequested;
@@ -563,7 +748,13 @@ int main() {
 	initTables();
 	s_spiHz = s_display.init(50000000);
 	s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, 0x0000);
+#if VIDEO_AUDIO_ON_CORE1
+	// The audio decoder needs more than the 4 KB core 1 gets by default, which has to fit in a 4 KB bank
+	static uint32_t core1Stack[8192 / sizeof(uint32_t)];
+	multicore_launch_core1_with_stack(core1Main, core1Stack, sizeof(core1Stack));
+#else
 	multicore_launch_core1(core1Main);
+#endif
 	printf("video player on %s, %lux%lu screen, sys %lu MHz, SPI %u Hz\n", CHIP_NAME, SCREEN_WIDTH, SCREEN_HEIGHT, clock_get_hz(clk_sys) / 1000000, s_spiHz);
 
 	s_stats.startUs = time_us_64();

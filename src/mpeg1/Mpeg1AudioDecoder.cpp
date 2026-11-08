@@ -4,6 +4,15 @@
 
 #include <cstring>
 
+// Puts the audio decoder's hot functions in RAM, with MD_MPEG_AUDIO_IN_RAM, for a target that otherwise runs
+// code through a flash cache it shares with other work, like the RP2040 decoding audio on its second core. The
+// section is the Raspberry Pi Pico SDK's, which copies it to RAM at boot. Not inlined, so the code stays in RAM.
+#if defined(MD_MPEG_AUDIO_IN_RAM) && MD_MPEG_AUDIO_IN_RAM
+#define AUDIO_HOT __attribute__((section(".time_critical.md_mpeg_audio"), noinline))
+#else
+#define AUDIO_HOT
+#endif
+
 // 4-byte header and the 2-byte CRC that may follow it
 #define AUDIO_HEADER_SIZE 6
 
@@ -344,7 +353,7 @@ bool Mpeg1AudioDecoder::hasPendingFrame() {
 }
 
 uint32_t Mpeg1AudioDecoder::channels() const {
-    return m_channelMode == AUDIO_MODE_MONO ? 1 : 2;
+    return MD_MPEG_AUDIO_MONO || m_channelMode == AUDIO_MODE_MONO ? 1 : 2;
 }
 
 void Mpeg1AudioDecoder::decode() {
@@ -517,14 +526,14 @@ void Mpeg1AudioDecoder::decodeHeader() {
     }
 }
 
-const quantizer_spec_t *Mpeg1AudioDecoder::audio_read_allocation(const int sb, const int tab3) {
+AUDIO_HOT const quantizer_spec_t *Mpeg1AudioDecoder::audio_read_allocation(const int sb, const int tab3) {
     const int tab4 = AUDIO_QUANT_LUT_STEP_3[tab3][sb];
     const int qtab = AUDIO_QUANT_LUT_STEP4[tab4 & 15][m_bitStream.pull(tab4 >> 4)];
     return qtab ? (&AUDIO_QUANT_TAB[qtab - 1]) : nullptr;
 }
 
 
-void Mpeg1AudioDecoder::audio_read_samples(const int ch, const int sb, const int part) {
+AUDIO_HOT void Mpeg1AudioDecoder::audio_read_samples(const int ch, const int sb, const int part) {
     const quantizer_spec_t *q = allocation[ch][sb];
     int32_t scale_factor = m_scale_factor[ch][sb][part];
     int32_t *sampled = sample[ch][sb];
@@ -604,7 +613,7 @@ static inline void audioWindowSecondHalf(audio_real_t *u, const audio_real_t *d,
 }
 
 // 32-point matrix transform. s: subband samples, ss: sample index 0..2, d: the block in V, 32 values written.
-void audio_matrix_transform(int32_t s[32][3], int ss, audio_real_t *d) {
+AUDIO_HOT void audio_matrix_transform(int32_t s[32][3], int ss, audio_real_t *d) {
     audio_real_t t01, t02, t03, t04, t05, t06, t07, t08, t09, t10, t11, t12,
             t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24,
             t25, t26, t27, t28, t29, t30, t31, t32, t33;
@@ -857,7 +866,7 @@ void audio_matrix_transform(int32_t s[32][3], int ss, audio_real_t *d) {
 }
 
 
-void Mpeg1AudioDecoder::decodeFrame() {
+AUDIO_HOT void Mpeg1AudioDecoder::decodeFrame() {
     // Prepare the quantizer table lookups
     int tab3 = 0;
     int sblimit = 0;
@@ -884,6 +893,7 @@ void Mpeg1AudioDecoder::decodeFrame() {
 
     // Read scale factor selector information
     int channels = (m_channelMode == AUDIO_MODE_MONO) ? 1 : 2;
+    const int outputChannels = static_cast<int>(this->channels());
     for (int sb = 0; sb < sblimit; sb++) {
         for (int ch = 0; ch < channels; ch++) {
             if (allocation[ch][sb]) {
@@ -936,6 +946,22 @@ void Mpeg1AudioDecoder::decodeFrame() {
                 audio_read_samples(0, sb, part);
                 audio_read_samples(1, sb, part);
             }
+#if MD_MPEG_AUDIO_MONO
+            // Mixed into channel 0. Above the bound both channels share their samples, so channel 0 has them.
+            for (int sb = 0; sb < m_bound; sb++) {
+                for (int i = 0; i < 3; i++) {
+                    sample[0][sb][i] = (sample[0][sb][i] + sample[1][sb][i]) >> 1;
+                }
+            }
+            for (int sb = m_bound; sb < sblimit; sb++) {
+                audio_read_samples(0, sb, part);
+            }
+            for (int sb = sblimit; sb < 32; sb++) {
+                sample[0][sb][0] = 0;
+                sample[0][sb][1] = 0;
+                sample[0][sb][2] = 0;
+            }
+#else
             for (int sb = m_bound; sb < sblimit; sb++) {
                 audio_read_samples(0, sb, part);
                 sample[1][sb][0] = sample[0][sb][0];
@@ -950,14 +976,15 @@ void Mpeg1AudioDecoder::decodeFrame() {
                 sample[1][sb][1] = 0;
                 sample[1][sb][2] = 0;
             }
+#endif
 
             // Synthesis loop
-            if (m_soundBuffer.free() >= 32 * 3 * channels) {
+            if (m_soundBuffer.free() >= 32 * 3 * outputChannels) {
                 for (int p = 0; p < 3; p++) {
                     // Shifting step
                     v_pos = (v_pos - 64) & 1023;
 
-                    for (int ch = 0; ch < channels; ch++) {
+                    for (int ch = 0; ch < outputChannels; ch++) {
                         audio_matrix_transform(sample[ch], p, &V[ch][v_pos >> 1]);
 
                         // Build U, windowing, calculate output
@@ -1006,7 +1033,7 @@ void Mpeg1AudioDecoder::decodeFrame() {
     }
 
     if (m_frameCallback) {
-        m_frameCallback(m_samplingFrequency, channels, &m_soundBuffer);
+        m_frameCallback(m_samplingFrequency, outputChannels, &m_soundBuffer);
     }
 
     m_stream.setSizeRequired(AUDIO_HEADER_SIZE);
