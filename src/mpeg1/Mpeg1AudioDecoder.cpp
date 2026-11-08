@@ -219,8 +219,9 @@ static constexpr AudioWindowQ16 AUDIO_SYNTHESIS_WINDOW_Q16 = audioMakeWindowQ16(
 
 // Returns round(v * window / 65536), so the sum keeps v's format. Splitting v at bit 14 keeps both products in
 // 32 bits: the low one is under 2^14 * 2^17, the bound on the high one is explained at AUDIO_GUARD_BITS.
-static inline audio_real_t audioWindowMul(const int index, const audio_real_t v) {
-    const int32_t window = AUDIO_SYNTHESIS_WINDOW_Q16.values[index];
+static const int32_t *const AUDIO_WINDOW = AUDIO_SYNTHESIS_WINDOW_Q16.values;
+
+static inline audio_real_t audioWindowMul(const int32_t window, const audio_real_t v) {
     return ((v >> 14) * window + (((v & 0x3FFF) * window) >> 14) + 2) >> 2;
 }
 
@@ -242,8 +243,10 @@ static inline audio_real_t audioSubband(const int32_t value) {
     return static_cast<float>(value);
 }
 
-static inline audio_real_t audioWindowMul(const int index, const audio_real_t v) {
-    return AUDIO_SYNTHESIS_WINDOW[index] * v;
+static const float *const AUDIO_WINDOW = AUDIO_SYNTHESIS_WINDOW;
+
+static inline audio_real_t audioWindowMul(const float window, const audio_real_t v) {
+    return window * v;
 }
 
 static inline AudioSample audioOutputSample(const audio_real_t value) {
@@ -571,8 +574,37 @@ void Mpeg1AudioDecoder::audio_read_samples(const int ch, const int sb, const int
     sampled[2] = audioLimitSample((val * (scale_factor >> 12) + ((val * (scale_factor & 4095) + 2048) >> 12)) >> 12);
 }
 
-// 32-point matrix transform. s: subband samples, ss: sample index 0..2, d: V, dp: write position, 64 values written.
-void audio_matrix_transform(int32_t s[32][3], int ss, audio_real_t *d, int dp) {
+// The matrix transform's 64 outputs v[0..63] are symmetric: v[16] = 0, v[32 - i] = -v[i] for i = 1..15,
+// v[32] = -v[0] and v[48 - i] = v[48 + i] for i = 1..15. So a block only stores 32 of them, d[k] = v[k] and
+// d[16 + k] = v[48 + k] for k = 0..15, and the windowing rebuilds the rest. This halves V without changing the
+// output: the mirrored values are negated before the multiply, exactly as when they were stored.
+
+// u[j] += w[j] * v[j] for j = 0..31, from block d. Each stored value is loaded once for both of its uses.
+template <typename Window>
+static inline void audioWindowFirstHalf(audio_real_t *u, const audio_real_t *d, const Window *w) {
+    u[0] += audioWindowMul(w[0], d[0]);
+    // v[16] is 0
+    for (int k = 1; k < 16; k++) {
+        const audio_real_t v = d[k];
+        u[k] += audioWindowMul(w[k], v);
+        u[32 - k] += audioWindowMul(w[32 - k], -v);
+    }
+}
+
+// u[j] += w[j] * v[32 + j] for j = 0..31, from block d
+template <typename Window>
+static inline void audioWindowSecondHalf(audio_real_t *u, const audio_real_t *d, const Window *w) {
+    u[0] += audioWindowMul(w[0], -d[0]);
+    u[16] += audioWindowMul(w[16], d[16]);
+    for (int k = 1; k < 16; k++) {
+        const audio_real_t v = d[16 + k];
+        u[16 + k] += audioWindowMul(w[16 + k], v);
+        u[16 - k] += audioWindowMul(w[16 - k], v);
+    }
+}
+
+// 32-point matrix transform. s: subband samples, ss: sample index 0..2, d: the block in V, 32 values written.
+void audio_matrix_transform(int32_t s[32][3], int ss, audio_real_t *d) {
     audio_real_t t01, t02, t03, t04, t05, t06, t07, t08, t09, t10, t11, t12,
             t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24,
             t25, t26, t27, t28, t29, t30, t31, t32, t33;
@@ -788,55 +820,40 @@ void audio_matrix_transform(int32_t s[32][3], int ss, audio_real_t *d, int dp) {
     t20 += t24;
     t24 += t02;
 
-    d[dp + 48] = -t33;
-    d[dp + 49] = d[dp + 47] = -t21;
-    d[dp + 50] = d[dp + 46] = -t17;
-    d[dp + 51] = d[dp + 45] = -t16;
-    d[dp + 52] = d[dp + 44] = -t01;
-    d[dp + 53] = d[dp + 43] = -t32;
-    d[dp + 54] = d[dp + 42] = -t29;
-    d[dp + 55] = d[dp + 41] = -t04;
-    d[dp + 56] = d[dp + 40] = -t03;
-    d[dp + 57] = d[dp + 39] = -t06;
-    d[dp + 58] = d[dp + 38] = -t25;
-    d[dp + 59] = d[dp + 37] = -t08;
-    d[dp + 60] = d[dp + 36] = -t11;
-    d[dp + 61] = d[dp + 35] = -t18;
-    d[dp + 62] = d[dp + 34] = -t09;
-    d[dp + 63] = d[dp + 33] = -t14;
-    d[dp + 32] = -t05;
-    d[dp + 0] = t05;
-    d[dp + 31] = -t30;
-    d[dp + 1] = t30;
-    d[dp + 30] = -t27;
-    d[dp + 2] = t27;
-    d[dp + 29] = -t28;
-    d[dp + 3] = t28;
-    d[dp + 28] = -t07;
-    d[dp + 4] = t07;
-    d[dp + 27] = -t26;
-    d[dp + 5] = t26;
-    d[dp + 26] = -t23;
-    d[dp + 6] = t23;
-    d[dp + 25] = -t10;
-    d[dp + 7] = t10;
-    d[dp + 24] = -t15;
-    d[dp + 8] = t15;
-    d[dp + 23] = -t12;
-    d[dp + 9] = t12;
-    d[dp + 22] = -t19;
-    d[dp + 10] = t19;
-    d[dp + 21] = -t20;
-    d[dp + 11] = t20;
-    d[dp + 20] = -t13;
-    d[dp + 12] = t13;
-    d[dp + 19] = -t24;
-    d[dp + 13] = t24;
-    d[dp + 18] = -t31;
-    d[dp + 14] = t31;
-    d[dp + 17] = -t02;
-    d[dp + 15] = t02;
-    d[dp + 16] = 0;
+    // The first 16 values of the block, the 16 others of its first half mirror them
+    d[0] = t05;
+    d[1] = t30;
+    d[2] = t27;
+    d[3] = t28;
+    d[4] = t07;
+    d[5] = t26;
+    d[6] = t23;
+    d[7] = t10;
+    d[8] = t15;
+    d[9] = t12;
+    d[10] = t19;
+    d[11] = t20;
+    d[12] = t13;
+    d[13] = t24;
+    d[14] = t31;
+    d[15] = t02;
+    // The last 16 values of the block, the 16 others of its second half mirror them
+    d[16] = -t33;
+    d[17] = -t21;
+    d[18] = -t17;
+    d[19] = -t16;
+    d[20] = -t01;
+    d[21] = -t32;
+    d[22] = -t29;
+    d[23] = -t04;
+    d[24] = -t03;
+    d[25] = -t06;
+    d[26] = -t25;
+    d[27] = -t08;
+    d[28] = -t11;
+    d[29] = -t18;
+    d[30] = -t09;
+    d[31] = -t14;
 }
 
 
@@ -941,31 +958,34 @@ void Mpeg1AudioDecoder::decodeFrame() {
                     v_pos = (v_pos - 64) & 1023;
 
                     for (int ch = 0; ch < channels; ch++) {
-                        audio_matrix_transform(sample[ch], p, V[ch], v_pos);
+                        audio_matrix_transform(sample[ch], p, &V[ch][v_pos >> 1]);
 
                         // Build U, windowing, calculate output
                         memset(U, 0, sizeof(U));
 
-                        int d_index = 512 - (v_pos >> 1);
-                        int v_index = (v_pos % 128) >> 1;
-                        while (v_index < 1024) {
-                            for (audio_real_t & i : U) {
-                                i += audioWindowMul((d_index++) & 511, V[ch][v_index++]);
+                        // Each block gives half of its values, alternating halves as the blocks age: the even
+                        // blocks' first halves and the odd blocks' second halves, or the other way round
+                        // Block b uses window taps from 512 - v_pos / 2 + 32 * b, modulo 512. That's a multiple
+                        // of 32, so a block's 32 taps never wrap.
+                        const int window = 512 - (v_pos >> 1);
+                        const bool firstHalfOfEven = (v_pos & 64) == 0;
+                        for (int block = 0; block < 16; block += 2) {
+                            const audio_real_t *d = &V[ch][block * 32];
+                            const auto *w = &AUDIO_WINDOW[(window + block * 32) & 511];
+                            if (firstHalfOfEven) {
+                                audioWindowFirstHalf(U, d, w);
+                            } else {
+                                audioWindowSecondHalf(U, d, w);
                             }
-
-                            v_index += 128 - 32;
-                            d_index += 64 - 32;
                         }
-
-                        d_index -= (512 - 32);
-                        v_index = (128 - 32 + 1024) - v_index;
-                        while (v_index < 1024) {
-                            for (audio_real_t & i : U) {
-                                i += audioWindowMul((d_index++) & 511, V[ch][v_index++]);
+                        for (int block = 1; block < 16; block += 2) {
+                            const audio_real_t *d = &V[ch][block * 32];
+                            const auto *w = &AUDIO_WINDOW[(window + block * 32) & 511];
+                            if (firstHalfOfEven) {
+                                audioWindowSecondHalf(U, d, w);
+                            } else {
+                                audioWindowFirstHalf(U, d, w);
                             }
-
-                            v_index += 128 - 32;
-                            d_index += 64 - 32;
                         }
 
                         // Output samples

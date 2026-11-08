@@ -70,7 +70,7 @@ private:
 	uint8_t m_bound = 0;
 
 	// Synthesis filter state, adapted from PL_MPEG
-	// Write position in V
+	// Write position in V counted as if blocks held all 64 values: a multiple of 64 in 0..1023
 	int v_pos = 0;
 
 	// By channel, subband. allocation is null if the subband has no bits.
@@ -81,8 +81,9 @@ private:
 	// By channel, subband, sample
 	int32_t sample[2][32][3]{0};
 
-	// Matrix transform output by channel, a ring of 16 blocks of 64
-	audio_real_t V[2][1024]{0};
+	// Matrix transform output by channel, a ring of 16 blocks. Each block keeps 32 of its 64 values, the others
+	// mirror them (see audioWindowFirstHalf).
+	audio_real_t V[2][512]{0};
 	// Windowed output of one 32-sample block
 	audio_real_t U[32]{0};
 
