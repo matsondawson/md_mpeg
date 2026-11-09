@@ -1,21 +1,42 @@
 #!/usr/bin/env bash
 # Raspberry Pi Pico (RP2040) and Pico 2 (RP2350) builds; everything runs in Docker.
 #
-#   pico/pico.sh [--board pico|pico2] build [clip.mpg]   Build the image and every app, embedding part of the clip.
-#   pico/pico.sh [--board pico|pico2] flash [target]     Flash benchmark_flash (default), video_player, video_player_sd or display_test. The board must be connected.
-#   pico/pico.sh test                                     Test the FAT32 code on the desktop, against generated disk images
-#   pico/pico.sh monitor [seconds]                        Print the board's USB serial output, default 180 s
+#   pico/pico.sh [options] build [clip.mpg]   Build the image and every app, embedding part of the clip.
+#   pico/pico.sh [options] flash [target]     Flash benchmark_flash (default), video_player, video_player_sd or display_test. The board must be connected.
+#   pico/pico.sh test                         Test the FAT32 code and display drivers on the desktop
+#   pico/pico.sh monitor [seconds]            Print the board's USB serial output, default 180 s
 #
-# --board defaults to pico, which also runs on a Pico W. Each board builds into pico/build/<board>.
+# Options:
+#   --board pico|pico2       Defaults to pico, which also runs on a Pico W
+#   --display <module>       Display module, default st7789_240x280; pico/CMakeLists.txt lists them
+#   --rotation 0|90|180|270  Display rotation, default the module's landscape
+#
+# Builds go into pico/build/<board>, with -<display> added for displays other than the default and
+# -r<rotation> for a rotation.
 set -euo pipefail
 
 IMAGE=md_mpeg_pico
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BOARD=pico
-if [ "${1:-}" = "--board" ]; then
-	BOARD=${2:?--board needs pico or pico2}
-	shift 2
-fi
+DISPLAY_MODULE=st7789_240x280
+ROTATION=
+while true; do
+	case "${1:-}" in
+		--board)
+			BOARD=${2:?--board needs pico or pico2}
+			shift 2
+			;;
+		--display)
+			DISPLAY_MODULE=${2:?--display needs a module name}
+			shift 2
+			;;
+		--rotation)
+			ROTATION=${2:?--rotation needs 0, 90, 180 or 270}
+			shift 2
+			;;
+		*) break ;;
+	esac
+done
 case "$BOARD" in
 	pico | pico2) ;;
 	*)
@@ -24,6 +45,12 @@ case "$BOARD" in
 		;;
 esac
 BUILD=pico/build/$BOARD
+if [ "$DISPLAY_MODULE" != st7789_240x280 ]; then
+	BUILD=$BUILD-$DISPLAY_MODULE
+fi
+if [ -n "$ROTATION" ]; then
+	BUILD=$BUILD-r$ROTATION
+fi
 # Fits the Pico W's 2 MB of flash with the code and wireless firmware. Starts at a pack holding a sequence
 # header, and includes termaudio.mpg's largest pictures.
 CLIP_START=471040
@@ -40,7 +67,8 @@ case "${1:-}" in
 		mkdir -p "$ROOT/$BUILD/clip"
 		head -c "$((CLIP_START + CLIP_BYTES))" "$clip" | tail -c "$CLIP_BYTES" > "$ROOT/$BUILD/clip/clip.mpg"
 		in_docker cmake -S pico -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_BOARD="$BOARD" \
-			-DMD_MPEG_CLIP_DIR="/src/$BUILD/clip"
+			-DMD_MPEG_CLIP_DIR="/src/$BUILD/clip" -DMD_MPEG_PICO_DISPLAY="$DISPLAY_MODULE" \
+			-DMD_MPEG_PICO_DISPLAY_ROTATION="$ROTATION"
 		in_docker cmake --build "$BUILD"
 		in_docker arm-none-eabi-size "$BUILD/benchmark_flash.elf" "$BUILD/video_player_sd.elf"
 		;;
@@ -52,6 +80,9 @@ case "${1:-}" in
 		in_docker pico/make_fat32_images.sh "$dir"
 		in_docker g++ -std=c++20 -O1 -g -Wall -Wextra -fsanitize=address,undefined -Ipico pico/fat32_test.cpp -o "$dir/fat32_test"
 		in_docker "$dir/fat32_test" "$dir"
+		in_docker g++ -std=c++20 -O1 -g -Wall -Wextra -fsanitize=address,undefined -Idisplay pico/display_drivers_test.cpp \
+			-o "$dir/display_drivers_test"
+		in_docker "$dir/display_drivers_test"
 		;;
 	flash)
 		docker run --rm --privileged -v /dev/bus/usb:/dev/bus/usb -v "$ROOT:/src" -w /src "$IMAGE" \
@@ -64,7 +95,7 @@ case "${1:-}" in
 			sh -c "stty -F $device raw -echo; timeout $seconds cat $device" || true
 		;;
 	*)
-		sed -n '2,9p' "$0"
+		sed -n '2,15p' "$0"
 		exit 1
 		;;
 esac

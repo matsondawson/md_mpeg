@@ -1,14 +1,16 @@
-// Plays video on an ST7789V, looping, from the embedded clip or from the .MPG files in the root directory
-// of a FAT32 microSD card if built with VIDEO_FROM_SD. Audio is decoded but not played, on core 1 between frame
-// scans if built with VIDEO_AUDIO_ON_CORE1, otherwise on core 0 with the video.
+// Plays video on the display module chosen at build time (see DisplayModule.h), looping, from the embedded
+// clip or from the .MPG files in the root directory of a FAT32 microSD card if built with VIDEO_FROM_SD.
+// Audio is decoded but not played, on core 1 between frame scans if built with VIDEO_AUDIO_ON_CORE1,
+// otherwise on core 0 with the video.
 //
 // With a card, the first .MPG plays, looping, and a button from GP15 to ground moves to the next one.
 // The screen shows why nothing is playing: red for a card or filesystem problem, blue for no .MPG, and
 // magenta for 2 s before moving on from a file that can't be played.
 //
 // Core 0 demuxes and decodes. When a frame is due, core 1 converts it to RGB565 one line at a time and sends
-// the lines by DMA, so the decoder keeps running and no frame buffer is needed. A displayed frame stays
-// intact while the next one decodes, as it's the reference for it, unless it's a B-frame.
+// the lines to the display, by DMA on SPI modules, so the decoder keeps running and no frame buffer is
+// needed (monochrome OLEDs keep their own small one). A displayed frame stays intact while the next one
+// decodes, as it's the reference for it, unless it's a B-frame.
 // Frames more than one period late are skipped. Stats go to USB serial if connected.
 //
 // Pictures of any size are scaled to the screen's height, interpolating pixels and lines, and cropped at the
@@ -29,7 +31,7 @@
 
 #include "Clocks.h"
 #include "DisplayTimestamper.h"
-#include "St7789.h"
+#include "DisplayModule.h"
 #include "mpeg1/Mpeg1AudioDecoder.h"
 #include "mpeg1/Mpeg1VideoDecoder.h"
 #include "mpeg1/MpegProgramStream.h"
@@ -44,8 +46,8 @@ extern "C" const uint8_t clip_end[];
 #endif
 
 namespace {
-	constexpr uint32_t SCREEN_WIDTH = St7789::WIDTH;
-	constexpr uint32_t SCREEN_HEIGHT = St7789::HEIGHT;
+	using board::SCREEN_WIDTH;
+	using board::SCREEN_HEIGHT;
 	// Most source pixels converted for one line, which limits how wide the visible part of a picture can be
 	constexpr uint32_t MAX_SOURCE_SPAN = 400;
 	constexpr uint32_t REPORT_FRAMES = 125;
@@ -232,8 +234,8 @@ namespace {
 		}
 	}
 
-	St7789 s_display;
-	uint s_spiHz = 0;
+	board::DisplayModule s_module;
+	auto &s_display = s_module.display;
 	std::atomic<bool> s_scanBusy{false};
 
 	// Written by core 1, read by core 0 as differences. A slightly stale value only affects a report.
@@ -580,9 +582,9 @@ namespace {
 		const uint64_t now = time_us_64();
 		const auto elapsedUs = static_cast<double>(now - s_stats.startUs);
 		const uint32_t convertUs = s_core1ConvertUs, scanUs = s_core1ScanUs;
-		printf("SPI %u MHz, %lu shown, %lu skipped, core 0 %.0f%% busy, latest frame %lu ms, "
+		printf("display bus %.1f MHz, %lu shown, %lu skipped, core 0 %.0f%% busy, latest frame %lu ms, "
 		       "core 1 convert %.0f%% (%.1f ms per frame), frame scan %.1f ms average, %.1f ms slowest\n",
-		       s_spiHz / 1000000, s_stats.shown, s_stats.skipped,
+		       s_module.bus.clockHz() / 1e6, s_stats.shown, s_stats.skipped,
 		       100.0 - static_cast<double>(s_stats.idleUs) / elapsedUs * 100.0, s_stats.maxLateUs / 1000,
 		       static_cast<double>(convertUs - s_stats.core1ConvertUs) / elapsedUs * 100.0,
 		       static_cast<double>(convertUs - s_stats.core1ConvertUs) / 1000.0 / s_stats.shown,
@@ -669,7 +671,7 @@ namespace {
 				buildPlan(videoDecoder->m_width, videoDecoder->m_height);
 				printf("  %.2f fps, %lu bit/s, %lu KB picture buffer declared\n", videoDecoder->m_frame_rate,
 				       videoDecoder->bit_rate, videoDecoder->vbv_buffer_size);
-				s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, 0x0000);
+				s_display.fill(0x0000);
 			}
 
 			const uint64_t now = time_us_64();
@@ -746,8 +748,8 @@ int main() {
 	}
 
 	initTables();
-	s_spiHz = s_display.init(50000000);
-	s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, 0x0000);
+	s_display.init();
+	s_display.fill(0x0000);
 #if VIDEO_AUDIO_ON_CORE1
 	// The audio decoder needs more than the 4 KB core 1 gets by default, which has to fit in a 4 KB bank
 	static uint32_t core1Stack[8192 / sizeof(uint32_t)];
@@ -755,7 +757,7 @@ int main() {
 #else
 	multicore_launch_core1(core1Main);
 #endif
-	printf("video player on %s, %lux%lu screen, sys %lu MHz, SPI %u Hz\n", CHIP_NAME, SCREEN_WIDTH, SCREEN_HEIGHT, clock_get_hz(clk_sys) / 1000000, s_spiHz);
+	printf("video player on %s, %lux%lu screen, sys %lu MHz, display bus %lu Hz\n", CHIP_NAME, SCREEN_WIDTH, SCREEN_HEIGHT, clock_get_hz(clk_sys) / 1000000, s_module.bus.clockHz());
 
 	s_stats.startUs = time_us_64();
 #if VIDEO_FROM_SD
@@ -764,7 +766,7 @@ int main() {
 	const auto showStatus = [&](const uint16_t color) {
 		if (color != screenColor) {
 			screenColor = color;
-			s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, color);
+			s_display.fill(color);
 		}
 	};
 	const auto fail = [&](const char *message, const uint16_t color) {
@@ -823,7 +825,7 @@ int main() {
 					break;
 				case PlayEnd::NextRequested:
 					fileIndex++;
-					s_display.fillRect(0, 0, St7789::WIDTH, St7789::HEIGHT, COLOR_BLACK);
+					s_display.fill(COLOR_BLACK);
 					break;
 				case PlayEnd::Unplayable:
 					fileIndex++;
