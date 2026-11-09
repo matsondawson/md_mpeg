@@ -81,7 +81,7 @@ public:
 		const uint8_t memoryAccess = 0xA0; // Rows and columns exchanged, rows reversed: landscape
 		command(0x36, &memoryAccess, 1);
 		command(0x21); // Inversion on, IPS panels need it for correct colours
-		const uint8_t gammaCurve = 0x02; // Gamma 1.8, softer than the default 2.2
+		const uint8_t gammaCurve = 0x01; // Gamma 2.2, the panel default
 		command(0x26, &gammaCurve, 1);
 		command(0x13); // Normal display mode
 		command(0x29); // Display on
