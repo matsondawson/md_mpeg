@@ -47,6 +47,8 @@ private:
 	SDL_Window* m_window;
 	SDL_Surface* m_renderSurface;
 	int32_t m_zoom;
+	// Display width / height of the picture, 0 to show its pixels square
+	double m_displayAspect = 0;
 	ControlBar m_controlBar;
 
 public:
@@ -70,7 +72,8 @@ public:
 	ScreenContextRgbSDL();
 	~ScreenContextRgbSDL();
 
-	void reinitScreen(uint32_t width, uint32_t height, int32_t zoom, bool fullScreen);
+	// displayAspect: display width / height of the picture, 0 if its pixels are square
+	void reinitScreen(uint32_t width, uint32_t height, int32_t zoom, bool fullScreen, double displayAspect = 0);
 
 	void clear() const;
 

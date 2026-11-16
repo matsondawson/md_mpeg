@@ -8,6 +8,11 @@
 
 #include <functional>
 
+// Set to 0 to build without MPEG-2 video (and MPEG-2 program streams), for a smaller binary
+#ifndef MD_MPEG_ENABLE_MPEG2
+#define MD_MPEG_ENABLE_MPEG2 1
+#endif
+
 // Bytes of video buffered. Must hold the largest picture plus a start code, override for small targets
 #ifndef MD_MPEG_VIDEO_RING_SIZE
 #define MD_MPEG_VIDEO_RING_SIZE (256 * 1024)
@@ -56,6 +61,11 @@ private:
 	bool m_dropLeadingBFrames = false;
 
 public:
+	// The sequence header was followed by a sequence extension: an MPEG-2 stream
+	bool m_mpeg2 = false;
+private:
+
+public:
 	// sequence
 	uint32_t m_width, m_height;
 	uint32_t aspect_ratio_enum;
@@ -84,8 +94,9 @@ private:
 	bool full_pel_forward_vector, full_pel_backward_vector;
 	int8_t forward_r_size, backward_r_size;
 
-	// 5 bits unsigned, but will be multiplied by signed
+	// 5 bits unsigned, but will be multiplied by signed. In MPEG-2 this is quantiser_scale_code.
 	int8_t quantizer_scale;
+	bool macroblock_quant;
 	int32_t motion_backward_h, motion_forward_h;
 	int32_t motion_backward_v, motion_forward_v;
 
@@ -129,6 +140,8 @@ public:
 	void flush() override;
 
 public:
+	// Skips zero bytes before the next start code. The bit stream must be byte aligned.
+	void skipZeroStuffing();
 	bool nextStartCode(uint32_t expected_start_code);
 	bool nextStartCodeRange(uint32_t start_code, uint32_t endCode);
 	[[nodiscard]] uint32_t lastStartCode() const;
@@ -136,8 +149,13 @@ public:
 	void setFrameCallback(const std::function<void(const Frame &frame)> &frameCallback);
 
 	void decodeSequence();
+	// Derives the frame and macroblock sizes and frame rate once the sequence header and its extensions are read
+	void finishSequence();
 	// Skips any extension data, then any user data, each up to the next start code
 	void skipExtensionAndUserData();
+	// Reads any extensions and user data following a sequence (SEQUENCE_HEADER_CODE) or picture
+	// (PICTURE_START_CODE) header, up to the next other start code. Other extensions are skipped.
+	void decodeExtensionAndUserData(uint32_t after);
 
 	void generateRgbFrameData(uint32_t *rgbData, const Frame &frame) const;
 
@@ -146,6 +164,8 @@ public:
 	uint32_t decodeFrame();
 	// Advances to and decodes the next picture, returns true if one was decoded or the stream ended
 	bool decodeFrame2();
+	// Shows the I/P anchor frame held back for display after the B-frames that precede it
+	void emitHeldAnchor();
 	// Decodes, recovering from corrupt data by skipping to the next picture
 	void decodeOrResync();
 	void resync();
@@ -163,7 +183,9 @@ public:
 	uint32_t pullMacroblockAddressIncrement();
 	RunLevel decodeDCTCoeff(bool first);
 	uint32_t decodeCodedBlockPattern();
-	void decodeMacroblockType();
+	// readQuantiserScale: read quantizer_scale here when macroblock_quant is set (MPEG-1). MPEG-2 has
+	// more macroblock mode fields first, and reads it itself.
+	void decodeMacroblockType(bool readQuantiserScale = true);
 	// Reads a motion code and returns motion with it applied, wrapped to the range r_size allows
 	int32_t updateMotionVector(int32_t r_size, int32_t motion);
 	void decodeMotionVectors();
@@ -175,4 +197,65 @@ public:
 	// One plane of the above: d is the destination plane, s the source plane, block_size 16 for luma, 8 for chroma
 	void videoProcessMacroblock(uint8_t* d, const uint8_t* s, int motion_h, int motion_v, uint32_t block_size) const;
 	void videoProcessMacroblockInterpolate(uint8_t* d, const uint8_t* s, int motion_h, int motion_v, uint32_t block_size) const;
+
+#if MD_MPEG_ENABLE_MPEG2
+	// MPEG-2 (Mpeg2Video.cpp). Main profile: 4:2:0, progressive or interlaced, frame or field pictures.
+private:
+	enum PictureStructure : uint8_t { TOP_FIELD = 1, BOTTOM_FIELD = 2, FRAME_PICTURE = 3 };
+
+	// Sequence extension
+	bool m_progressiveSequence = true;
+	uint32_t m_frameRateExtN = 0, m_frameRateExtD = 0;
+
+	// Picture coding extension
+	uint8_t m_fCode[2][2]{};
+	uint8_t m_intraDcPrecision = 0;
+	uint8_t m_pictureStructure = FRAME_PICTURE;
+	bool m_topFieldFirst = false;
+	bool m_framePredFrameDct = true;
+	bool m_concealmentMotionVectors = false;
+	bool m_qScaleType = false;
+	bool m_intraVlcFormat = false;
+	bool m_alternateScan = false;
+	bool m_repeatFirstField = false;
+	bool m_progressiveFrame = true;
+
+	// The first field of a frame of field pictures has been decoded into m_ptrFrameCurrent, the second is next
+	bool m_secondField = false;
+	// Fields shown for each frame emitted, for timing frames without a PTS: 2, or 3 with repeat_first_field
+	uint32_t m_frameFields = 2;
+	int64_t m_lastEmittedPtsMillis = -1;
+	uint32_t m_lastEmittedFields = 2;
+
+	// Macroblock modes
+	uint8_t m_motionType = 0;
+	bool m_fieldDct = false;
+	// Motion vector predictors and the macroblock's vectors, [r][s][t]: r first/second vector, s forward/backward,
+	// t horizontal/vertical. Luma half pels, vertical in field lines for field prediction.
+	int32_t m_pmv[2][2][2]{};
+	int32_t m_mv[2][2][2]{};
+	// motion_vertical_field_select[r][s], 0 = top field
+	uint8_t m_fieldSelect[2][2]{};
+	// Dual prime: derived vectors for predicting from the opposite parity field, [0] for the top field
+	int32_t m_dmv[2][2]{};
+
+	void decodeSequenceExtension();
+	void decodeQuantMatrixExtension();
+	void decodePictureCodingExtension();
+	void processSliceMpeg2(uint32_t slice);
+	void processMacroblockMpeg2(bool slice_begin, uint32_t mbRows);
+	void decodeMotionVectorsMpeg2(uint32_t s);
+	int32_t decodeMotionComponent(uint32_t fCode, int32_t prediction);
+	void predictMacroblockMpeg2();
+	// Prediction from frame ref into the current picture: luma (x, y) w x h in the destination view
+	// (a field view if dstField >= 0), from field srcField of ref (the whole frame if srcField < 0)
+	void predictPart(const Frame* ref, int srcField, int dstField, int x, int y, uint32_t h, int mvx, int mvy,
+	                 bool average) const;
+	// The reference for direction s (0 forward), field parity fieldSelect in a field picture
+	const Frame* referenceFrame(uint32_t s, uint32_t fieldSelect) const;
+	void decodeBlocksMpeg2(uint32_t cbp);
+	RunLevel decodeDCTCoeffIntraVlc1();
+	// Display bookkeeping for a frame about to be passed to the frame callback
+	void timeFrame(Frame& frame);
+#endif
 };

@@ -56,11 +56,11 @@ static fs::path media(const std::string &name) {
 	return g_mediaDir / name;
 }
 
-// Generates a clip with ffmpeg if it doesn't exist yet
-static fs::path generate(const std::string &name, const std::string &ffmpegArgs) {
+// Generates a clip with ffmpeg if it doesn't exist yet. Format "mpeg" has MPEG-1 pack headers, "vob" MPEG-2.
+static fs::path generate(const std::string &name, const std::string &ffmpegArgs, const std::string &format = "mpeg") {
 	const auto path = media(name);
 	if (!fs::exists(path)) {
-		if (!run("ffmpeg -nostdin -y " + ffmpegArgs + " -f mpeg \"" + path.string() + "\"")) {
+		if (!run("ffmpeg -nostdin -y " + ffmpegArgs + " -f " + format + " \"" + path.string() + "\"")) {
 			std::cout << "  ffmpeg failed to generate " << name << std::endl;
 			g_failures++;
 		}
@@ -462,6 +462,167 @@ static void testSeek() {
 	}
 }
 
+#if MD_MPEG_ENABLE_MPEG2
+// ---------------------------------------------------------------- MPEG-2
+
+// Decodes the video, every picture in display order as yuv420p cropped to the picture size, like ffmpeg's rawvideo
+static std::vector<std::vector<uint8_t>> decodeYuv(const fs::path &path, bool &mpeg2) {
+	MStream::FileStreamRead file(path.c_str());
+	Mpeg1::MpegProgramStream demux;
+	const auto video = std::make_unique<Mpeg1VideoDecoder>();
+	demux.setVideoDecoder(video.get());
+	std::vector<std::vector<uint8_t>> frames;
+	video->setFrameCallback([&](const Frame &frame) {
+		const uint32_t w = video->m_width, h = video->m_height;
+		std::vector<uint8_t> yuv;
+		yuv.reserve(w * h * 3 / 2);
+		const auto copy = [&](const uint8_t *plane, const uint32_t stride, const uint32_t pw, const uint32_t ph) {
+			for (uint32_t y = 0; y < ph; y++) {
+				yuv.insert(yuv.end(), plane + y * stride, plane + y * stride + pw);
+			}
+		};
+		copy(frame.m_yData, frame.m_frameSize.luma_width, w, h);
+		copy(frame.m_cbData, frame.m_frameSize.chroma_width, (w + 1) / 2, (h + 1) / 2);
+		copy(frame.m_crData, frame.m_frameSize.chroma_width, (w + 1) / 2, (h + 1) / 2);
+		frames.push_back(std::move(yuv));
+	});
+	for (long i = 0; i < 20'000'000; i++) {
+		try {
+			if (demux.nextPacket(file) == Mpeg1::DemuxResult::EndOfStream) {
+				break;
+			}
+		} catch (const std::exception &ex) {
+			std::cout << "  exception: " << ex.what() << std::endl;
+			g_failures++;
+			break;
+		}
+	}
+	mpeg2 = video->m_mpeg2;
+	return frames;
+}
+
+// Every picture must match ffmpeg's decode. The IDCTs differ, and the difference builds up through predicted
+// pictures, so this is a PSNR floor rather than exact equality.
+static void checkVideoMatchesFfmpeg(const fs::path &clip, const int expectedFrames, const bool expectMpeg2,
+                                    const double minPsnrDb = 40.0) {
+	if (!fs::exists(clip)) {
+		return;
+	}
+	const auto reference = fs::path(clip.string() + ".yuv");
+	if (!fs::exists(reference)) {
+		run("ffmpeg -nostdin -y -i \"" + clip.string() + "\" -an -fps_mode passthrough -f rawvideo -pix_fmt yuv420p \""
+		    + reference.string() + "\"");
+	}
+	const auto expected = readFile(reference);
+	bool mpeg2 = false;
+	const auto frames = decodeYuv(clip, mpeg2);
+	CHECK(mpeg2 == expectMpeg2);
+	CHECK(static_cast<int>(frames.size()) == expectedFrames);
+	if (frames.empty()) {
+		return;
+	}
+	const size_t frameBytes = frames[0].size();
+	CHECK(expected.size() == frameBytes * expectedFrames);
+	double minPsnr = 200, sumPsnr = 0;
+	size_t minPsnrIndex = 0;
+	size_t compared = 0;
+	for (size_t i = 0; i < frames.size() && (i + 1) * frameBytes <= expected.size(); i++) {
+		double sumSquares = 0;
+		for (size_t j = 0; j < frameBytes; j++) {
+			const double d = static_cast<double>(frames[i][j]) - expected[i * frameBytes + j];
+			sumSquares += d * d;
+		}
+		const double mse = sumSquares / static_cast<double>(frameBytes);
+		const double psnr = mse > 0 ? 10.0 * std::log10(255.0 * 255.0 / mse) : 100.0;
+		if (psnr < minPsnr) {
+			minPsnr = psnr;
+			minPsnrIndex = i;
+		}
+		sumPsnr += psnr;
+		compared++;
+	}
+	std::cout << "  " << clip.filename().string() << ": " << compared << " pictures, PSNR from ffmpeg min " << minPsnr
+		<< " dB (picture " << minPsnrIndex << "), mean " << sumPsnr / static_cast<double>(compared) << " dB" << std::endl;
+	CHECK(minPsnr >= minPsnrDb);
+}
+
+static const std::string VIDEO_MOVING = "-f lavfi -i testsrc2=size=352x288:rate=25";
+
+// The same comparison for MPEG-1, the baseline for the MPEG-2 PSNR floors
+static void testMpeg1MatchesFfmpeg() {
+	checkVideoMatchesFfmpeg(generate("m1.mpg", VIDEO_MOVING + " -t 2 -c:v mpeg1video -bf 2 -g 12 -an"), 50, false);
+}
+
+static void testMpeg2Progressive() {
+	const auto clip = generate("m2.vob", VIDEO_MOVING + " " + TONE + " -t 2 -c:v mpeg2video -bf 2 -g 12 -c:a mp2", "vob");
+	checkVideoMatchesFfmpeg(clip, 50, true);
+	// The player's path, with audio
+	const auto p = decode(clip);
+	CHECK(p->finished);
+	CHECK(p->frames == 50);
+	checkSteps(p->displayPts, 0, 39, 41);
+	CHECK_RANGE(p->audioSeconds(), 1.9, 2.1);
+}
+
+// Field DCT and field motion compensation in frame pictures
+static void testMpeg2Interlaced() {
+	checkVideoMatchesFfmpeg(generate("m2interlaced.vob", VIDEO_MOVING + ",setfield=tff -t 2 -c:v mpeg2video"
+	                                                     " -flags +ildct+ilme -bf 2 -g 12 -an", "vob"), 50, true);
+	checkVideoMatchesFfmpeg(generate("m2interlacedbff.vob", VIDEO_MOVING + ",setfield=bff -t 2 -c:v mpeg2video"
+	                                                        " -flags +ildct+ilme -bf 2 -g 12 -an", "vob"), 50, true);
+}
+
+// Alternate scan, intra VLC table B-15, non-linear quantiser scale, 11-bit intra DC, custom matrices
+static void testMpeg2CodingOptions() {
+	checkVideoMatchesFfmpeg(generate("m2options.vob", VIDEO_MOVING + " -t 2 -c:v mpeg2video -alternate_scan 1"
+	                                                  " -intra_vlc 1 -non_linear_quant 1 -qmax 28 -b:v 3M -intra_dc_precision 3 -bf 2 -g 12 -an"
+	                                                  " -intra_matrix 8,16,19,22,26,27,29,34,16,16,22,24,27,29,34,37,19,22,26,27,29,34,34,38,22,22,26,27,29,34,37,40,22,26,27,29,32,35,40,48,26,27,29,32,35,40,48,58,26,27,29,34,38,46,56,69,27,29,35,38,46,56,69,83"
+	                                                  " -inter_matrix 16,17,18,19,20,21,22,23,17,18,19,20,21,22,23,24,18,19,20,21,22,23,24,25,19,20,21,22,23,24,26,27,20,21,22,23,25,26,27,28,21,22,23,24,26,27,28,30,22,23,24,26,27,28,30,31,23,24,25,27,28,30,31,33",
+	                                 "vob"), 50, true);
+	// Big motion: f_code above 7
+	checkVideoMatchesFfmpeg(generate("m2fast.vob", "-f lavfi -i \"testsrc2=size=704x576:rate=25,scroll=h=0.04:v=0.03\""
+	                                               " -t 2 -c:v mpeg2video -me_range 400 -bf 2 -g 12 -an", "vob"), 50, true);
+}
+
+// Each video in the other system stream: detection is per layer
+static void testMpeg2MixedLayers() {
+	checkVideoMatchesFfmpeg(generate("m2inm1.mpg", VIDEO_MOVING + " -t 1 -c:v mpeg2video -bf 2 -an"), 25, true);
+	checkVideoMatchesFfmpeg(generate("m1inm2.vob", VIDEO_MOVING + " -t 1 -c:v mpeg1video -bf 2 -an", "vob"), 25, false);
+}
+
+// Dual prime motion compensation, which ffmpeg's encoder doesn't use. Needs mjpegtools' mpeg2enc.
+static void testMpeg2DualPrime() {
+	if (!run("command -v mpeg2enc")) {
+		std::cout << "  mpeg2enc not found, skipping" << std::endl;
+		return;
+	}
+	const auto clip = media("m2dualprime.vob");
+	if (!fs::exists(clip)) {
+		const auto elementary = media("m2dualprime.m2v");
+		run("ffmpeg -nostdin -y -f lavfi -i \"testsrc2=size=720x576:rate=25,setfield=tff\" -t 2 -pix_fmt yuv420p"
+		    " -f yuv4mpegpipe - | mpeg2enc -f 8 -I 1 -b 6000 -R 0 --dualprime-mpeg2 -o \"" + elementary.string() + "\"");
+		run("ffmpeg -nostdin -y -i \"" + elementary.string() + "\" -c copy -f vob \"" + clip.string() + "\"");
+	}
+	CHECK(fs::exists(clip));
+	checkVideoMatchesFfmpeg(clip, 50, true);
+}
+
+static void testMpeg2Seek() {
+	const auto clip = generate("m2long.vob", VIDEO_320 + " " + TONE + " -t 20 -c:v mpeg2video -bf 2 -g 12 -c:a mp2", "vob");
+	Pipeline p(clip);
+	p.runUntil(50);
+	CHECK_RANGE(p.demux.durationMillis(), 19000, 20500);
+	p.seekTo(12000);
+	const size_t index = p.displayPts.size();
+	p.runUntil(p.frames + 10);
+	CHECK(p.displayPts.size() > index);
+	if (p.displayPts.size() > index) {
+		CHECK_RANGE(p.displayPts[index], 10500, 13500);
+		checkSteps(p.displayPts, index, 39, 41);
+	}
+}
+#endif
+
 int main(int argc, char *argv[]) {
 	g_mediaDir = argc > 1 ? fs::path(argv[1]) : fs::temp_directory_path() / "md_mpeg_test_media";
 	fs::create_directories(g_mediaDir);
@@ -484,6 +645,15 @@ int main(int argc, char *argv[]) {
 		{"corrupt", testCorrupt},
 		{"concatenated", testConcatenated},
 		{"seek", testSeek},
+#if MD_MPEG_ENABLE_MPEG2
+		{"mpeg-1 matches ffmpeg", testMpeg1MatchesFfmpeg},
+		{"mpeg-2 progressive", testMpeg2Progressive},
+		{"mpeg-2 interlaced", testMpeg2Interlaced},
+		{"mpeg-2 coding options", testMpeg2CodingOptions},
+		{"mpeg-2 in mixed system layers", testMpeg2MixedLayers},
+		{"mpeg-2 dual prime", testMpeg2DualPrime},
+		{"mpeg-2 seek", testMpeg2Seek},
+#endif
 	};
 	for (const auto &[name, test] : tests) {
 		g_currentTest = name;

@@ -1,11 +1,12 @@
 # MPEG1 Video and Audio Player
 
-This is a C++ application for playing MPEG1 video and MP2 audio files.
+This is a C++ application for playing MPEG1 and MPEG2 video and MP2 audio files.
 
 ## Features
 
-- Plays MPEG1 video and MP2 audio from `.mpg` files.
-- Supports MPEG-PS (`.mpg`) files containing MPEG1 video and MP2 audio streams.
+- Plays MPEG1 and MPEG2 video and MP2 audio from `.mpg` and `.vob` files.
+- Supports MPEG-1 and MPEG-2 program streams (`.mpg`, `.vob`), detected per file.
+- MPEG2 main profile video: progressive and interlaced, frame and field pictures, 3:2 pulldown timing.
 - Audio/video sync using the audio as the master clock; falls back to the wall clock for files with no audio, or once the audio ends.
 - Late video frames are dropped to keep up with the audio.
 
@@ -91,11 +92,26 @@ cmake -S . -B build -DMD_MPEG_AUDIO_FIXED_POINT=OFF
 
 Without CMake, define it as 0 or 1 on the compiler command line. `src/mpeg1/AudioSample.h` has the default.
 
+## MPEG2
+
+MPEG2 video and program streams are decoded by default. Turn `MD_MPEG_ENABLE_MPEG2` off for an MPEG1-only
+build with a smaller binary (the Pico build has it off by default):
+
+```bash
+cmake -S . -B build -DMD_MPEG_ENABLE_MPEG2=OFF
+```
+
+Without CMake, define it as 0 or 1 on the compiler command line; it must be the same for every file that
+includes the decoder headers. Only 4:2:0 video is supported (not the 4:2:2 profile). Interlaced pictures are
+shown as whole frames, without deinterlacing.
+
 ## Tests
 
 The tests generate small test clips with ffmpeg (no media is stored in the repository) and decode them
 headless: clean streams, B-frames, odd frame sizes, audio-only and video-only streams, unsupported audio,
-truncated, corrupt and concatenated files, and seeking. They are skipped if ffmpeg isn't installed.
+truncated, corrupt and concatenated files, and seeking. MPEG2 clips (progressive, interlaced, the alternate
+coding options, and dual prime if mjpegtools' `mpeg2enc` is installed) are compared picture by picture with
+ffmpeg's decode. They are skipped if ffmpeg isn't installed.
 
 ```bash
 cmake --build build
@@ -105,7 +121,8 @@ ctest --test-dir build --output-on-failure
 ## Code
 
 - `src/md_mpeg.cpp`: the player (SDL window, audio, input, A/V sync)
-- `src/mpeg1/`: program stream demuxer, MPEG-1 video and MP2 audio decoders
+- `src/mpeg1/`: program stream demuxer, MPEG-1 video and MP2 audio decoders. `Mpeg2Video.cpp` has the
+  MPEG-2 macroblock layer.
 - `tests/md_mpeg_tests.cpp`: decoder tests
 
 ## Encoding Compatible Files
@@ -130,7 +147,8 @@ Test media is not included in the repository; put your own files in `testfiles/`
 
 - Corrupt data is skipped with a console message. Pictures predicted from a corrupt picture show errors until the next I-frame.
 - Seeking estimates the file position from the average bit rate, so it lands within a few seconds of the target in variable bit rate files.
-- Only supports MPEG1 video and MP2 (MPEG-1 Layer II) audio. MPEG2 video and MP3 audio are not supported.
+- Only supports MPEG1/MPEG2 video and MP2 (MPEG-1 Layer II) audio. MP3, AC-3 (most DVD audio) and LPCM audio
+  are not supported, so DVD `.vob` files usually play without sound. MPEG-2 transport streams (`.ts`) are not supported.
 - Raw `.mp2` audio files (without a program stream) are not supported.
 
 ## Acknowledgments

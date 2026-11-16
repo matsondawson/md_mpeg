@@ -68,11 +68,15 @@ void ScreenContextRgbSDL::blitSurface() {
 		return;
 	}
 
-	auto height = (m_renderSurface->h * winSurface->w) / m_renderSurface->w;
+	// Fit the picture's display shape, which isn't its pixel size when the pixels aren't square (e.g. DVD)
+	const double aspect = m_displayAspect > 0
+		                      ? m_displayAspect
+		                      : static_cast<double>(m_renderSurface->w) / m_renderSurface->h;
+	auto height = static_cast<int>(winSurface->w / aspect + 0.5);
 	auto width = winSurface->w;
 	if (height > winSurface->h) {
 		height = winSurface->h;
-		width = (m_renderSurface->w * winSurface->h) / m_renderSurface->h;
+		width = static_cast<int>(winSurface->h * aspect + 0.5);
 	}
 	const SDL_Rect rect = {(winSurface->w - width) / 2, (winSurface->h - height) / 2, width, height};
 	sdlError(SDL_StretchSurface(m_renderSurface, nullptr, winSurface, &rect, SDL_SCALEMODE_LINEAR));
@@ -262,11 +266,12 @@ std::optional<int64_t> ScreenContextRgbSDL::audioClockMs() {
 }
 
 void ScreenContextRgbSDL::reinitScreen(const uint32_t width, const uint32_t height, const int32_t zoom,
-                                       const bool fullScreen) {
+                                       const bool fullScreen, const double displayAspect) {
 	m_width = static_cast<int32_t>(width);
 	m_height = static_cast<int32_t>(height);
 	m_zoom = zoom;
-	m_windowWidth = m_width * m_zoom;
+	m_displayAspect = displayAspect;
+	m_windowWidth = displayAspect > 0 ? static_cast<int32_t>(m_height * m_zoom * displayAspect + 0.5) : m_width * m_zoom;
 	m_windowHeight = m_height * m_zoom;
 
 	m_imageData.reset(new uint32_t[width * height]);

@@ -46,6 +46,8 @@ set(MD_MPEG_CLIP_DIR "" CACHE PATH "Directory holding clip.mpg, the clip to embe
 option(MD_MPEG_SPARSE_IDCT "Skip the IDCT arithmetic for rows and columns with only a first coefficient" ON)
 # The Pico's audio output is mono
 option(MD_MPEG_AUDIO_MONO "Mix stereo audio to mono before the synthesis filter, halving its work" ON)
+# Off by default: a bigger binary, and the Pico only has the memory for small MPEG-2 pictures anyway
+option(MD_MPEG_ENABLE_MPEG2 "Decode MPEG-2 video and program streams as well as MPEG-1" OFF)
 
 # The video ring holds the largest picture. Measured peaks: termaudio 9049 bytes, a 140x120 variable bit
 # rate file 10378 (its header declared 6 KB, so headers can't be trusted for this). The RP2350's 520 KB of
@@ -63,6 +65,7 @@ function(add_decoder_app name main_source)
 		"${MD_MPEG_SRC}/mpeg1/Frame.cpp"
 		"${MD_MPEG_SRC}/mpeg1/Sequence.cpp"
 		"${MD_MPEG_SRC}/mpeg1/Mpeg1VideoDecoder.cpp"
+		"${MD_MPEG_SRC}/mpeg1/Mpeg2Video.cpp"
 		"${MD_MPEG_SRC}/mpeg1/Mpeg1AudioDecoder.cpp"
 	)
 	target_include_directories(${name} PRIVATE "${MD_MPEG_SRC}" "${MD_MPEG_SRC}/stream" "${MD_MPEG_SRC}/mpeg1")
@@ -70,6 +73,7 @@ function(add_decoder_app name main_source)
 		MD_MPEG_AUDIO_FIXED_POINT=1
 		MD_MPEG_SPARSE_IDCT=$<BOOL:${MD_MPEG_SPARSE_IDCT}>
 		MD_MPEG_AUDIO_MONO=$<BOOL:${MD_MPEG_AUDIO_MONO}>
+		MD_MPEG_ENABLE_MPEG2=$<BOOL:${MD_MPEG_ENABLE_MPEG2}>
 		MD_MPEG_DEMUX_RING_SIZE=512
 		MD_MPEG_VIDEO_RING_SIZE=${MD_MPEG_PICO_VIDEO_RING_SIZE}
 		MD_MPEG_AUDIO_RING_SIZE=384

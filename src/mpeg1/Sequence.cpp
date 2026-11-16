@@ -68,8 +68,6 @@ void Mpeg1VideoDecoder::decodeSequence() {
 	aspect_ratio_enum = m_bitStream.pull(4);
 	aspect_ratio = ASPECT_RATIOS[aspect_ratio_enum];
 	frame_rate_enum = m_bitStream.pull(4);
-	m_frame_rate = FRAME_RATES[frame_rate_enum];
-	m_frame_period_millis = m_frame_rate != 0 ? 1000.0f / m_frame_rate : 0.0f;
 	// Units of 400 bit/s
 	bit_rate = m_bitStream.pull(18);
 	if (bit_rate == 0x3FFFF) {
@@ -104,8 +102,34 @@ void Mpeg1VideoDecoder::decodeSequence() {
 		memset(non_intra_quant_matrix, 16, 64);
 	}
 
+	// An MPEG-2 sequence extension, if one follows, sets these again
+	m_mpeg2 = false;
+#if MD_MPEG_ENABLE_MPEG2
+	m_progressiveSequence = true;
+	m_frameRateExtN = m_frameRateExtD = 0;
+#endif
+}
+
+void Mpeg1VideoDecoder::finishSequence() {
+	m_frame_rate = FRAME_RATES[frame_rate_enum];
 	m_macroblockWidth = (m_width + 15) >> 4;
 	m_macroblockHeight = (m_height + 15) >> 4;
+#if MD_MPEG_ENABLE_MPEG2
+	if (m_mpeg2) {
+		m_frame_rate = m_frame_rate * static_cast<float>(m_frameRateExtN + 1) / static_cast<float>(m_frameRateExtD + 1);
+		// aspect_ratio_information is the display aspect ratio in MPEG-2; make it the pel aspect ratio (height/width)
+		static const float DISPLAY_ASPECT_RATIOS[] = {0, 0, 4.0f / 3, 16.0f / 9, 2.21f};
+		const float displayAspect = aspect_ratio_enum < 5 ? DISPLAY_ASPECT_RATIOS[aspect_ratio_enum] : 0;
+		aspect_ratio = aspect_ratio_enum == 1 ? 1 : displayAspect != 0 && m_height != 0
+			               ? static_cast<float>(m_width) / static_cast<float>(m_height) / displayAspect
+			               : 0;
+		if (!m_progressiveSequence) {
+			// Each field has whole macroblock rows
+			m_macroblockHeight = 2 * ((m_height + 31) >> 5);
+		}
+	}
+#endif
+	m_frame_period_millis = m_frame_rate != 0 ? 1000.0f / m_frame_rate : 0.0f;
 	mb_size = m_macroblockWidth * m_macroblockHeight;
 
 	m_frameSize = {
@@ -114,7 +138,7 @@ void Mpeg1VideoDecoder::decodeSequence() {
 	};
 
 	debug_out << std::dec;
-	debug_out << "Sequence Header(";
+	debug_out << "Sequence Header(" << (m_mpeg2 ? "MPEG-2 " : "MPEG-1 ");
 	debug_out << "size: " << m_width << "x" << m_height << " @ " << m_frame_rate << "fps, ";
 	debug_out << "aspect_ratio: " << aspect_ratio << ", ";
 	debug_out << "bit_rate: ";
