@@ -28,6 +28,7 @@ int main(int argc, char *argv[]) {
 	sdl.setTitle(std::filesystem::path(argv[1]).filename().string() + " - md_mpeg");
 	uint32_t screenWidth = 0;
 	uint32_t screenHeight = 0;
+	double screenAspect = 0;
 	bool audioInited = false;
 
 	const auto playbackStartMs = now();
@@ -100,10 +101,14 @@ int main(int argc, char *argv[]) {
 			return;
 		}
 		const auto &frame = frameQueue.front();
-		if (frame.width != screenWidth || frame.height != screenHeight) {
+		// The decoder's pel aspect ratio is pixel height / width, 0 if unknown
+		const double pelAspect = videoDecoder.aspect_ratio;
+		const double displayAspect = pelAspect > 0 ? frame.width / (frame.height * pelAspect) : 0;
+		if (frame.width != screenWidth || frame.height != screenHeight || displayAspect != screenAspect) {
 			screenWidth = frame.width;
 			screenHeight = frame.height;
-			sdl.reinitScreen(frame.width, frame.height, 1, false);
+			screenAspect = displayAspect;
+			sdl.reinitScreen(frame.width, frame.height, 1, false, displayAspect);
 		}
 		std::memcpy(sdl.rgbData(), frame.rgb.get(), static_cast<size_t>(frame.width) * frame.height * sizeof(uint32_t));
 		sdl.blitSurface();

@@ -13,6 +13,16 @@
 #include "../stream/FileStream.h"
 #include "../stream/RingBufferWithStartCodeEvent.h"
 
+// Set to 0 to build without MPEG-2 video (and MPEG-2 program streams), for a smaller binary
+#ifndef MD_MPEG_ENABLE_MPEG2
+#define MD_MPEG_ENABLE_MPEG2 1
+#endif
+
+// Bytes of input buffered, override for small targets
+#ifndef MD_MPEG_DEMUX_RING_SIZE
+#define MD_MPEG_DEMUX_RING_SIZE 2048
+#endif
+
 namespace Mpeg1 {
 	customException(CorruptPacketException);
 
@@ -75,7 +85,7 @@ namespace Mpeg1 {
 	};
 
 	class MpegProgramStream {
-		MStream::RingBufferWithStartCodeEvent<2048> m_buffer;
+		MStream::RingBufferWithStartCodeEvent<MD_MPEG_DEMUX_RING_SIZE> m_buffer;
 
 		uint32_t m_bitCount, m_bitsLeft;
 		int32_t m_streamingPacketBytesRemaining;
@@ -430,6 +440,12 @@ namespace Mpeg1 {
 		}
 
 		void decodePackHeader() {
+#if MD_MPEG_ENABLE_MPEG2
+			if (m_buffer.peek(1) >> 6 == 1) {
+				decodeMpeg2PackHeader();
+				return;
+			}
+#endif
 			const uint8_t t = m_buffer.pull(1);
 			if (t >> 4 != 2) {
 				throw CorruptPacketException("pack header missing 0010");
@@ -467,14 +483,66 @@ namespace Mpeg1 {
 			}
 			program_mux_rate = (program_mux_rate >> 1) & 0x3FFFFF;
 			m_streamingPacketBytesRemaining = 0;
+			setPackTiming(system_clock_reference_base_millis, program_mux_rate);
+		}
 
-			m_lastScrMillis = system_clock_reference_base_millis;
+		void setPackTiming(const int32_t scrMillis, const uint32_t programMuxRate) {
+			m_lastScrMillis = scrMillis;
 			if (m_firstPackPosition < 0) {
 				m_firstPackPosition = m_lastPackPosition;
 				m_firstScrMillis = m_lastScrMillis;
 			}
-			m_muxRateBytesPerSecond = program_mux_rate * 50; // units of 50 bytes/s
+			m_muxRateBytesPerSecond = programMuxRate * 50; // units of 50 bytes/s
 		}
+
+#if MD_MPEG_ENABLE_MPEG2
+		// '01' SCR[32..30] marker SCR[29..15] marker SCR[14..0] marker SCR_ext(9) marker, 22:program_mux_rate,
+		// 2 markers, 5 reserved, 3:pack_stuffing_length, then that many stuffing bytes
+		void decodeMpeg2PackHeader() {
+			const uint32_t high = m_buffer.pull(3);
+			const uint32_t low = m_buffer.pull(3);
+			// high: 01 s32..s30 m s29..s28 | s27..s20 | s19..s15 m s14..s13. low: s12..s5 | s4..s0 m e8..e7 | e6..e0 m
+			if (!(high & (1 << 18)) || !(high & (1 << 2)) || !(low & (1 << 10)) || !(low & 1)) {
+				throw CorruptPacketException("Marker bit not 1");
+			}
+			const uint64_t scr = static_cast<uint64_t>((high >> 19) & 7) << 30
+			                     | static_cast<uint64_t>((high >> 3) & 0x7FFF) << 15
+			                     | static_cast<uint64_t>((high & 3) << 13 | (low >> 11));
+			const uint32_t muxRate = m_buffer.pull(3);
+			if ((muxRate & 3) != 3) {
+				throw CorruptPacketException("Marker bit not 1");
+			}
+			const uint32_t stuffing = m_buffer.pull(1) & 7;
+			m_buffer.skip(stuffing);
+			m_streamingPacketBytesRemaining = 0;
+			setPackTiming(static_cast<int32_t>(scr / 90), muxRate >> 2);
+		}
+
+		// After the packet length: '10' and flags, PTS_DTS_flags and more flags, PES_header_data_length, the fields
+		// those flags select, then stuffing up to the header length
+		void decodeMpeg2PesHeader(const bool audio) {
+			pull(1);
+			const uint32_t ptsDtsFlags = pull(1) >> 6;
+			const uint32_t headerLength = pull(1);
+			if (headerLength > static_cast<uint32_t>(m_streamingPacketBytesRemaining)) {
+				throw CorruptPacketException("PES header longer than the packet");
+			}
+			uint32_t read = 0;
+			if (ptsDtsFlags & 2) {
+				if (headerLength < 5) {
+					throw CorruptPacketException("PES header too short for its PTS");
+				}
+				m_bitsLeft = m_bitCount = 0;
+				// '0010' or '0011', then the PTS
+				pullBits(4);
+				const int32_t pts = decodeTime();
+				read = 5;
+				m_ptrCurrentDecoderStream->setPts(pts);
+				if (!audio) m_lastVideoPtsMillis = pts;
+			}
+			skip(headerLength - read);
+		}
+#endif
 
 		void decodeSystemHeader() {
 			m_streamingPacketBytesRemaining = m_buffer.pull(2);
@@ -510,6 +578,13 @@ namespace Mpeg1 {
 
 		void decodeStreamHeader(const uint32_t startCode, const bool audio) {
 			m_streamingPacketBytesRemaining = m_buffer.pull(2);
+
+#if MD_MPEG_ENABLE_MPEG2
+			if (peek() >> 6 == 2) {
+				decodeMpeg2PesHeader(audio);
+				return;
+			}
+#endif
 
 			// remove stuffing bytes
 			while (peek() == 0xFF) {
@@ -573,6 +648,19 @@ namespace Mpeg1 {
 				continue;
 			}
 			const uint8_t *b = &tail[i + 4];
+#if MD_MPEG_ENABLE_MPEG2
+			// MPEG-2: '01' SCR[32..30] marker SCR[29..28] / [27..20] / [19..15] marker [14..13] / [12..5] / [4..0] marker
+			if ((b[0] >> 6) == 1 && (b[0] & 4) && (b[2] & 4) && (b[4] & 4) && (b[5] & 1)) {
+				const uint64_t scr = static_cast<uint64_t>((b[0] >> 3) & 7) << 30
+				                     | static_cast<uint64_t>(b[0] & 3) << 28
+				                     | static_cast<uint64_t>(b[1]) << 20
+				                     | static_cast<uint64_t>(b[2] >> 3) << 15
+				                     | static_cast<uint64_t>(b[2] & 3) << 13
+				                     | static_cast<uint64_t>(b[3]) << 5
+				                     | static_cast<uint64_t>(b[4] >> 3);
+				return {static_cast<int64_t>(start + i), static_cast<int64_t>(scr / 90)};
+			}
+#endif
 			if ((b[0] >> 4) != 2 || !(b[0] & 1) || !(b[2] & 1) || !(b[4] & 1)) {
 				continue;
 			}

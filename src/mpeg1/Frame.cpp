@@ -2,6 +2,8 @@
 
 #include "Mpeg1VideoDecoder.h"
 #include "../mpeg1/Frame.h"
+#include "PixelWords.h"
+#include "VideoInternal.h"
 
 #include <cstring>
 
@@ -50,7 +52,7 @@ const static uint16_t us_motionVector1[] =
 
 const static int16_t *s_motionVector1 = (int16_t *) us_motionVector1;
 
-static const uint8_t VIDEO_PREMULTIPLIER_MATRIX[] = {
+const uint8_t VIDEO_PREMULTIPLIER_MATRIX[] = {
 	32, 44, 42, 38, 32, 25, 17, 9,
 	44, 62, 58, 52, 44, 35, 24, 12,
 	42, 58, 55, 49, 42, 33, 23, 12,
@@ -61,17 +63,33 @@ static const uint8_t VIDEO_PREMULTIPLIER_MATRIX[] = {
 	9, 12, 12, 10, 9, 7, 5, 2
 };
 
-static inline uint8_t clampToByte(int32_t n) {
-	return (n > 255) ? 255 : (n < 0) ? 0 : n;
-}
+
+// Skip the arithmetic for columns and rows whose only non-zero coefficient is the first. Most are like that,
+// and the result is the same: such a column transforms to its first value in every row, and such a row to
+// (first + 128) >> 8 in every column.
+#ifndef MD_MPEG_SPARSE_IDCT
+#define MD_MPEG_SPARSE_IDCT 1
+#endif
 
 // In-place 8x8 inverse DCT. block holds 64 premultiplied coefficients in raster order, and receives the samples.
-void video_idct(int *block) {
+void video_idct(int32_t *block) {
 	int b1, b3, b4, b6, b7, tmp1, tmp2, m0,
 			x0, x1, x2, x3, x4, y3, y4, y5, y6, y7;
 
 	// Transform columns
 	for (int i = 0; i < 8; ++i) {
+#if MD_MPEG_SPARSE_IDCT
+		if ((block[1 * 8 + i] | block[2 * 8 + i] | block[3 * 8 + i] | block[4 * 8 + i] | block[5 * 8 + i] |
+		     block[6 * 8 + i] | block[7 * 8 + i]) == 0) {
+			const int32_t dc = block[i];
+			if (dc != 0) {
+				for (int row = 1; row < 8; row++) {
+					block[row * 8 + i] = dc;
+				}
+			}
+			continue;
+		}
+#endif
 		b1 = block[4 * 8 + i];
 		b3 = block[2 * 8 + i] + block[6 * 8 + i];
 		b4 = block[5 * 8 + i] - block[3 * 8 + i];
@@ -102,6 +120,16 @@ void video_idct(int *block) {
 
 	// Transform rows
 	for (int i = 0; i < 64; i += 8) {
+#if MD_MPEG_SPARSE_IDCT
+		if ((block[1 + i] | block[2 + i] | block[3 + i] | block[4 + i] | block[5 + i] | block[6 + i] |
+		     block[7 + i]) == 0) {
+			const int32_t value = (block[i] + 128) >> 8;
+			for (int column = 0; column < 8; column++) {
+				block[column + i] = value;
+			}
+			continue;
+		}
+#endif
 		b1 = block[4 + i];
 		b3 = block[2 + i] + block[6 + i];
 		b4 = block[5 + i] - block[3 + i];
@@ -143,11 +171,14 @@ Frame::~Frame() {
 
 void Frame::init(const int32_t ptsMillis, const FrameSize frameSize) {
 	if (frameSize != m_frameSize) {
+		// Cleared before allocating, so a failed allocation leaves nothing freed twice
 		delete[] m_yData;
-		m_yData = new uint8_t[frameSize.luma_width * frameSize.luma_height]();
 		delete[] m_crData;
-		m_crData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		delete[] m_cbData;
+		m_yData = m_crData = m_cbData = nullptr;
+		m_frameSize = {};
+		m_yData = new uint8_t[frameSize.luma_width * frameSize.luma_height]();
+		m_crData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		m_cbData = new uint8_t[frameSize.chroma_width * frameSize.chroma_height]();
 		m_frameSize = frameSize;
 	}
@@ -156,7 +187,14 @@ void Frame::init(const int32_t ptsMillis, const FrameSize frameSize) {
 
 uint32_t Mpeg1VideoDecoder::decodeFrame() {
 	// PTS of this picture's start code, -1 if it has none (presentation time is then extrapolated)
+#if MD_MPEG_ENABLE_MPEG2
+	// The second field of a frame goes into the same frame as the first
+	if (!m_secondField) {
+		m_ptrFrameCurrent->init(m_stream.getPts(0), m_frameSize);
+	}
+#else
 	m_ptrFrameCurrent->init(m_stream.getPts(0), m_frameSize);
+#endif
 
 	uint32_t m_temporal_reference;
 	PULL2dump1(m_temporal_reference, 10, picture_coding_type, 3, 16);
@@ -191,7 +229,29 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 		}
 	}
 
-	skipExtensionAndUserData();
+	decodeExtensionAndUserData(PICTURE_START_CODE);
+
+#if MD_MPEG_ENABLE_MPEG2
+	if (m_mpeg2) {
+		if (picture_coding_type == VideoPictureType_D) {
+			throw std::runtime_error("D-pictures are not allowed in MPEG-2");
+		}
+		auto &fields = m_ptrFrameCurrent->m_fields;
+		if (m_pictureStructure != FRAME_PICTURE) {
+			fields = 2;
+		} else if (m_progressiveSequence) {
+			// repeat_first_field repeats the whole frame, twice if top_field_first
+			fields = m_repeatFirstField ? (m_topFieldFirst ? 6 : 4) : 2;
+		} else {
+			fields = m_repeatFirstField ? 3 : 2;
+		}
+		while (nextStartCodeRange(SLICE_START_CODE_START, SLICE_START_CODE_END)) {
+			processSliceMpeg2(lastStartCode() & 255);
+		}
+		return m_temporal_reference;
+	}
+	m_ptrFrameCurrent->m_fields = 2;
+#endif
 
 	while (nextStartCodeRange(SLICE_START_CODE_START, SLICE_START_CODE_END)) {
 		processSlice(lastStartCode() & 255);
@@ -336,17 +396,18 @@ void Mpeg1VideoDecoder::decodeMotionVectors() {
 }
 
 int32_t Mpeg1VideoDecoder::updateMotionVector(int32_t r_size, int32_t motion) {
-	const auto index = static_cast<int32_t>(m_bitStream.peek(11 + 6)); // + up to 6 r_size
-	const int32_t value = (index >> (7 + 6))
-		                      ? s_motionVector1[index >> (6 + 6)] // 5 bits
-		                      : s_motionVector[index >> (6)]; // 11 bits
+	// 11 bit motion code + sign, then up to 8 bits of motion_r (r_size is 0..6 in MPEG-1, 0..8 in MPEG-2)
+	const auto index = static_cast<int32_t>(m_bitStream.peek(11 + 8));
+	const int32_t value = (index >> (7 + 8))
+		                      ? s_motionVector1[index >> (6 + 8)] // 5 bits
+		                      : s_motionVector[index >> (8)]; // 11 bits
 
 	int dropBits = value & 0xFF;
 	const int32_t m_code = value >> 8;
 	int32_t fscale = 1 << r_size;
 	if (m_code && r_size) {
 		dropBits += r_size;
-		const int32_t r = (index >> ((11 + 6) - dropBits)) & (fscale - 1);
+		const int32_t r = (index >> ((11 + 8) - dropBits)) & (fscale - 1);
 		const int32_t d = ((abs(m_code) - 1) << r_size) + r + 1;
 		if (m_code < 0) {
 			motion -= d;
@@ -425,78 +486,110 @@ void Mpeg1VideoDecoder::videoInterpolateMacroblock(const int motion_h, const int
 		DEST_INDEX += dest_scan; \
 	}}
 
-// ReSharper disable once CppMemberFunctionMayBeConst
-void Mpeg1VideoDecoder::videoProcessMacroblock(uint8_t *d, const uint8_t *s, const int motion_h, const int motion_v,
-                                               const uint32_t block_size) const {
-	const uint32_t dw = m_macroblockWidth * block_size;
+// Predicts one SIZE x SIZE block from s into d, a word at a time. HALF_PEL is the half pel flags, horizontal in
+// bit 1 and vertical in bit 0. INTERPOLATE averages the prediction with what d already holds.
+// ROWS is SIZE for MPEG-1, and also SIZE / 2 or SIZE / 4 for MPEG-2 field prediction.
+template <uint32_t SIZE, uint32_t HALF_PEL, bool INTERPOLATE>
+static void videoPredictBlock(uint8_t *d, const uint8_t *s, const uint32_t dw, const uint32_t rows = SIZE) {
+	constexpr int WORDS = SIZE / 4;
+	for (uint32_t y = 0; y < rows; y++) {
+		uint32_t row[WORDS];
+		if constexpr (HALF_PEL == 0) {
+			PixelWords::loadRow<WORDS>(s, row);
+		} else if constexpr (HALF_PEL == 3) {
+			uint32_t right[WORDS], below[WORDS], belowRight[WORDS];
+			PixelWords::loadRow<WORDS>(s, row);
+			PixelWords::loadRow<WORDS>(s + 1, right);
+			PixelWords::loadRow<WORDS>(s + dw, below);
+			PixelWords::loadRow<WORDS>(s + dw + 1, belowRight);
+			for (int i = 0; i < WORDS; i++) {
+				row[i] = PixelWords::average4(row[i], right[i], below[i], belowRight[i]);
+			}
+		} else {
+			uint32_t other[WORDS];
+			PixelWords::loadRow<WORDS>(s, row);
+			PixelWords::loadRow<WORDS>(HALF_PEL == 1 ? s + dw : s + 1, other);
+			for (int i = 0; i < WORDS; i++) {
+				row[i] = PixelWords::average2(row[i], other[i]);
+			}
+		}
+		for (int i = 0; i < WORDS; i++) {
+			uint32_t value = row[i];
+			if constexpr (INTERPOLATE) {
+				value = PixelWords::average2(PixelWords::loadAligned(d + 4 * i), value);
+			}
+			PixelWords::storeAligned(d + 4 * i, value);
+		}
+		s += dw;
+		d += dw;
+	}
+}
+
+template <uint32_t SIZE, bool INTERPOLATE>
+void videoPredictBlockHalfPel(uint8_t *d, const uint8_t *s, const uint32_t dw, const uint32_t halfPel, const uint32_t rows) {
+	// halfPel is always 0..3
+	switch (halfPel) {
+		case 0: videoPredictBlock<SIZE, 0, INTERPOLATE>(d, s, dw, rows); break;
+		case 1: videoPredictBlock<SIZE, 1, INTERPOLATE>(d, s, dw, rows); break;
+		case 2: videoPredictBlock<SIZE, 2, INTERPOLATE>(d, s, dw, rows); break;
+		default: videoPredictBlock<SIZE, 3, INTERPOLATE>(d, s, dw, rows); break;
+	}
+}
+
+template void videoPredictBlockHalfPel<16, false>(uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t);
+template void videoPredictBlockHalfPel<16, true>(uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t);
+template void videoPredictBlockHalfPel<8, false>(uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t);
+template void videoPredictBlockHalfPel<8, true>(uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t);
+
+// One plane of a macroblock's prediction. d starts at a multiple of 8 pixels in a plane whose width is a
+// multiple of 8, so its rows are word aligned.
+template <bool INTERPOLATE>
+static void videoPredictPlane(uint8_t *d, const uint8_t *s, const uint32_t mb_row, const uint32_t mb_col,
+                              const uint32_t macroblockWidth, const uint32_t macroblockHeight, const int motion_h,
+                              const int motion_v, const uint32_t block_size) {
+	const uint32_t dw = macroblockWidth * block_size;
 
 	const int32_t hp = motion_h >> 1, vp = motion_v >> 1;
-	uint32_t si = ((mb_row * block_size) + vp) * dw + (mb_col * block_size) + hp;
-	uint32_t di = (mb_row * dw + mb_col) * block_size;
+	const uint32_t si = ((mb_row * block_size) + vp) * dw + (mb_col * block_size) + hp;
+	const uint32_t di = (mb_row * dw + mb_col) * block_size;
 
-	const uint32_t max_address = (dw * (m_macroblockHeight * block_size - block_size + 1) - block_size);
+	const uint32_t max_address = (dw * (macroblockHeight * block_size - block_size + 1) - block_size);
 	if (si > max_address || di > max_address) {
 		// Motion vector points outside the frame (corrupt data), leave the block as it is
 		debug_out << "Motion vector out of range" << std::endl;
 		return;
 	}
 
-	const auto odd_h = (motion_h & 1) << 1, odd_v = (motion_v & 1);
-	// Half pel flags: odd_h | odd_v is always 0..3
-	// ReSharper disable once CppDefaultCaseNotHandledInSwitchStatement
-	switch (odd_h | odd_v) {
-		case 0:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (s[si]));
-			break;
-		case 1:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (s[si] + s[si + dw] + 1) >> 1);
-			break;
-		case 2:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (s[si] + s[si + 1] + 1) >> 1);
-			break;
-		case 3:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (s[si] + s[si + 1] + s[si + dw] + s[si + dw + 1] + 2) >> 2);
-			break;
+	const uint32_t halfPel = ((motion_h & 1) << 1) | (motion_v & 1);
+	if (block_size == 16) {
+		videoPredictBlockHalfPel<16, INTERPOLATE>(d + di, s + si, dw, halfPel, 16);
+	} else {
+		videoPredictBlockHalfPel<8, INTERPOLATE>(d + di, s + si, dw, halfPel, 8);
 	}
 }
 
-// ReSharper disable once CppMemberFunctionMayBeConst
+void Mpeg1VideoDecoder::videoProcessMacroblock(uint8_t *d, const uint8_t *s, const int motion_h, const int motion_v,
+                                               const uint32_t block_size) const {
+	videoPredictPlane<false>(d, s, mb_row, mb_col, m_macroblockWidth, m_macroblockHeight, motion_h, motion_v, block_size);
+}
+
 void Mpeg1VideoDecoder::videoProcessMacroblockInterpolate(uint8_t *d, const uint8_t *s, const int motion_h, const int motion_v,
                                                           const uint32_t block_size) const {
-	const uint32_t dw = m_macroblockWidth * block_size;
-
-	const int32_t hp = motion_h >> 1;
-	const int32_t vp = motion_v >> 1;
-	uint32_t si = ((mb_row * block_size) + vp) * dw + (mb_col * block_size) + hp;
-	uint32_t di = (mb_row * dw + mb_col) * block_size;
-
-	uint32_t max_address = (dw * (m_macroblockHeight * block_size - block_size + 1) - block_size);
-	if (si > max_address || di > max_address) {
-		// Motion vector points outside the frame (corrupt data), leave the block as it is
-		debug_out << "Motion vector out of range" << std::endl;
-		return;
-	}
-
-	const auto odd_h = (motion_h & 1) << 1, odd_v = (motion_v & 1);
-
-	// ReSharper disable once CppDefaultCaseNotHandledInSwitchStatement
-	switch (odd_h | odd_v) {
-		case 0:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (d[di] + (s[si]) + 1) >> 1);
-			break;
-		case 1:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (d[di] + ((s[si] + s[si + dw] + 1) >> 1) + 1) >> 1);
-			break;
-		case 2:
-			BLOCK_SET(d, di, dw, si, dw, block_size, (d[di] + ((s[si] + s[si + 1] + 1) >> 1) + 1) >> 1);
-			break;
-		case 3:
-			BLOCK_SET(d, di, dw, si, dw, block_size,
-			              (d[di] + ((s[si] + s[si + 1] + s[si + dw] + s[si + dw + 1] + 2) >> 2) + 1) >> 1);
-			break;
-	}
+	videoPredictPlane<true>(d, s, mb_row, mb_col, m_macroblockWidth, m_macroblockHeight, motion_h, motion_v, block_size);
 }
 
+
+// MPEG-1 reconstruction (ISO/IEC 11172-2 2.4.4.1-2): (2 * level [+ sign]) * quantizer_scale * W / 16, truncated
+// towards zero, made odd towards zero, then clipped
+static inline int32_t dequantizeMpeg1(const int32_t level, const bool intra, const int32_t quantizerScale,
+                                      const int32_t weight) {
+	int32_t value = (2 * level + (intra ? 0 : (level < 0 ? -1 : 1))) * quantizerScale * weight;
+	value = value >= 0 ? value >> 4 : -(-value >> 4);
+	if ((value & 1) == 0 && value != 0) {
+		value -= value > 0 ? 1 : -1;
+	}
+	return value > 2047 ? 2047 : value < -2048 ? -2048 : value;
+}
 
 void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 	for (int i = 0; i < 6; i++) {
@@ -549,17 +642,7 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 			int de_zig_zagged = VIDEO_ZIG_ZAG[n];
 			n++;
 
-			// Dequantize, oddify, clip
-			level <<= 1;
-			level += (level < 0 ? -1 : 1);
-
-			level *= (quantizer_scale * quant_matrix[de_zig_zagged]) >> 4;
-			if ((level & 1) == 0) {
-				level -= level > 0 ? 1 : -1;
-			}
-			// Level clamp
-			if (level > 2047) level = 2047;
-			else if (level < -2048) level = -2048;
+			level = dequantizeMpeg1(level, false, quantizer_scale, quant_matrix[de_zig_zagged]);
 
 			// level is 12 bits, premul is 6bits = 18bits so block data has to be int32
 			// Save premultiplied coefficient
@@ -582,20 +665,7 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 				int de_zig_zagged = VIDEO_ZIG_ZAG[n];
 				n++;
 
-				// Dequantize, oddify, clip
-				level <<= 1;
-				if (!macroblock_intra) {
-					level += (level < 0 ? -1 : 1);
-				}
-				level *= (quantizer_scale * quant_matrix[de_zig_zagged]) >> 4;
-				if ((level & 1) == 0) {
-					level -= level > 0 ? 1 : -1;
-				}
-				if (level > 2047) {
-					level = 2047;
-				} else if (level < -2048) {
-					level = -2048;
-				}
+				level = dequantizeMpeg1(level, macroblock_intra, quantizer_scale, quant_matrix[de_zig_zagged]);
 				// level is 12 bits, premul is 6bits = 18bits so block data has to be int32
 				// Save premultiplied coefficient
 				block_data[de_zig_zagged] = level * VIDEO_PREMULTIPLIER_MATRIX[de_zig_zagged];
@@ -673,6 +743,13 @@ uint32_t Mpeg1VideoDecoder::decodeDCTDCSizeLuminance() {
 
 	if (value == 0) {
 		value = s_dctDcSizeLuminance1[index & 0x07];
+#if MD_MPEG_ENABLE_MPEG2
+		if (value == 0) {
+			// MPEG-2 sizes 9-11, for intra_dc_precision above 8 bits: 1111 1110, 1111 1111 0, 1111 1111 1
+			const uint32_t code = m_bitStream.peek(9);
+			value = code < 0x1FE ? 0x98 : code == 0x1FE ? 0xA9 : 0xB9;
+		}
+#endif
 	}
 
 	m_bitStream.skip(value & 0xf);
@@ -699,14 +776,22 @@ int Mpeg1VideoDecoder::decodeDCTDCSizeChrominance() {
 	uint32_t value = s_dctDcSizeChrominance[index >> 4];
 	if (value == 0) {
 		value = s_dctDcSizeChrominance1[index & 0xf];
+#if MD_MPEG_ENABLE_MPEG2
+		if (value == 0) {
+			// MPEG-2 sizes 9-11: 1111 1111 0, 1111 1111 10, 1111 1111 11
+			const uint32_t code = m_bitStream.peek(10);
+			value = code < 0x3FE ? 0x99 : code == 0x3FE ? 0xAA : 0xBA;
+		}
+#endif
 	}
 	m_bitStream.skip(value & 0xf);
 	return value >> 4;
 }
 
+// Entry 1 is '0000 0000 1', coded_block_pattern 0, which only MPEG-2 allows
 const uint16_t s_codedBlockPattern[] =
 {
-	0x0000, 0x0000, 0x2709, 0x1b09, 0x3b09, 0x3709, 0x2f09, 0x1f09,
+	0x0000, 0x0009, 0x2709, 0x1b09, 0x3b09, 0x3709, 0x2f09, 0x1f09,
 	0x3a08, 0x3a08, 0x3608, 0x3608, 0x2e08, 0x2e08, 0x1e08, 0x1e08,
 	0x3908, 0x3908, 0x3508, 0x3508, 0x2d08, 0x2d08, 0x1d08, 0x1d08,
 	0x2608, 0x2608, 0x1a08, 0x1a08, 0x2508, 0x2508, 0x1908, 0x1908,
@@ -853,7 +938,7 @@ const static uint16_t s_macroblockTypeB[] =
 	0x0603, 0x0603, 0x0603, 0x0603, 0x0603, 0x0603, 0x0603, 0x0603
 };
 
-void Mpeg1VideoDecoder::decodeMacroblockType() {
+void Mpeg1VideoDecoder::decodeMacroblockType(const bool readQuantiserScale) {
 	switch (picture_coding_type) {
 		case VideoPictureType_INTRA: {
 			uint32_t index = m_bitStream.peek(2);
@@ -868,7 +953,8 @@ void Mpeg1VideoDecoder::decodeMacroblockType() {
 			m_bitStream.skip(value & 3);
 
 			// Quantizer scale
-			if (value >> 2) {
+			macroblock_quant = value >> 2;
+			if (macroblock_quant && readQuantiserScale) {
 				quantizer_scale = m_bitStream.pull(5);
 			}
 
@@ -888,7 +974,8 @@ void Mpeg1VideoDecoder::decodeMacroblockType() {
 			macroblock_intra = (value & 0x01);
 
 			// Quantizer scale
-			if (value & 0x10) {
+			macroblock_quant = value & 0x10;
+			if (macroblock_quant && readQuantiserScale) {
 				quantizer_scale = m_bitStream.pull(5);
 			}
 			break;
@@ -907,13 +994,15 @@ void Mpeg1VideoDecoder::decodeMacroblockType() {
 			macroblock_intra = (value & 0x01);
 
 			// Quantizer scale
-			if (value & 0x10) {
+			macroblock_quant = value & 0x10;
+			if (macroblock_quant && readQuantiserScale) {
 				quantizer_scale = m_bitStream.pull(5);
 			}
 			break;
 		}
 		case VideoPictureType_D:
 		default:
+			macroblock_quant = false;
 			break;
 	}
 
@@ -1238,6 +1327,18 @@ RunLevel Mpeg1VideoDecoder::decodeDCTCoeff(const bool first) {
 
 		// !!!!!!!!!!!! ESCAPE !!!!!!!!!!!!!!!!!!
 		if (offset >= 4 && offset <= 7) {
+#if MD_MPEG_ENABLE_MPEG2
+			if (m_mpeg2) {
+				// 6-bit run, 12-bit signed level
+				const uint32_t runLevel = m_bitStream.pull(18);
+				result.run = runLevel >> 12;
+				result.level = static_cast<int16_t>(static_cast<int32_t>(runLevel << 20) >> 20);
+				if (result.level == 0 || result.level == -2048) {
+					throw std::runtime_error("Corrupt video data: forbidden escape level");
+				}
+				return result;
+			}
+#endif
 			result.run = m_bitStream.pull(6);
 			result.level = m_bitStream.pull(8);
 

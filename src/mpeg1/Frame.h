@@ -34,6 +34,8 @@ public:
 	uint8_t* m_cbData;
 
 	FrameSize m_frameSize;
+	// Fields this frame is displayed for: 2, more with MPEG-2 repeat_first_field
+	uint8_t m_fields = 2;
 
 	Frame();
 	~Frame();

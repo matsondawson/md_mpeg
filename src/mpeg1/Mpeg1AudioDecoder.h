@@ -10,6 +10,19 @@
 
 #include <functional>
 
+// Bytes of audio buffered. Must hold the largest frame, override for small targets
+#ifndef MD_MPEG_AUDIO_RING_SIZE
+#define MD_MPEG_AUDIO_RING_SIZE (128 * 1024)
+#endif
+
+// 1: mixes stereo to mono before the synthesis filter, so output is always one channel. The filter is linear,
+// so this is the average of the two channels' output, to within rounding, for half the synthesis work and half
+// the filter's memory. Set it with the CMake option of the same name, it must be the same for everything that
+// uses the decoder.
+#ifndef MD_MPEG_AUDIO_MONO
+#define MD_MPEG_AUDIO_MONO 0
+#endif
+
 // Type of the values in the synthesis filter
 #if MD_MPEG_AUDIO_FIXED_POINT
 using audio_real_t = int32_t;
@@ -65,7 +78,7 @@ private:
 	uint8_t m_bound = 0;
 
 	// Synthesis filter state, adapted from PL_MPEG
-	// Write position in V
+	// Write position in V counted as if blocks held all 64 values: a multiple of 64 in 0..1023
 	int v_pos = 0;
 
 	// By channel, subband. allocation is null if the subband has no bits.
@@ -74,15 +87,19 @@ private:
 	// By channel, subband, part
 	uint8_t m_scale_factor[2][32][3]{0};
 	// By channel, subband, sample
-	int sample[2][32][3]{0};
+	int32_t sample[2][32][3]{0};
 
-	// Matrix transform output by channel, a ring of 16 blocks of 64
-	audio_real_t V[2][1024]{0};
+	// Channels the synthesis filter runs for
+	static constexpr int SYNTHESIS_CHANNELS = MD_MPEG_AUDIO_MONO ? 1 : 2;
+
+	// Matrix transform output by channel, a ring of 16 blocks. Each block keeps 32 of its 64 values, the others
+	// mirror them (see audioWindowFirstHalf).
+	audio_real_t V[SYNTHESIS_CHANNELS][512]{0};
 	// Windowed output of one 32-sample block
 	audio_real_t U[32]{0};
 
 public:
-	MStream::RingBufferWithSizeEvent<128*1024> m_stream;
+	MStream::RingBufferWithSizeEvent<MD_MPEG_AUDIO_RING_SIZE> m_stream;
 private:
 	MStream::ReadBitStream m_bitStream;
 
@@ -96,6 +113,7 @@ public:
 	static constexpr uint32_t SAMPLES_PER_FRAME = 1152;
 
 	[[nodiscard]] int32_t firstFramePtsMillis() const { return m_firstFramePtsMillis; }
+	// Channels in the output
 	[[nodiscard]] uint32_t channels() const;
 	// A complete frame is buffered, waiting for space in the sound buffer
 	[[nodiscard]] bool hasPendingFrame();
