@@ -11,6 +11,32 @@
 #ifndef MD_MPEG_IDCT_M0
 #define MD_MPEG_IDCT_M0 0
 #endif
+// The Cortex-M0+ assembler prediction, pico/predict_m0.S, for blocks not averaged into the destination
+#ifndef MD_MPEG_PREDICT_M0
+#define MD_MPEG_PREDICT_M0 0
+#endif
+#if MD_MPEG_PREDICT_M0
+#define PREDICT_M0_DECLARE(words, hp) \
+	extern "C" void video_predict_m0_##words##_##hp##_0(uint8_t *, const uint8_t *, uint32_t, uint32_t); \
+	extern "C" void video_predict_m0_##words##_##hp##_1(uint8_t *, const uint8_t *, uint32_t, uint32_t); \
+	extern "C" void video_predict_m0_##words##_##hp##_2(uint8_t *, const uint8_t *, uint32_t, uint32_t); \
+	extern "C" void video_predict_m0_##words##_##hp##_3(uint8_t *, const uint8_t *, uint32_t, uint32_t);
+PREDICT_M0_DECLARE(2, 0) PREDICT_M0_DECLARE(2, 1) PREDICT_M0_DECLARE(2, 2) PREDICT_M0_DECLARE(2, 3)
+PREDICT_M0_DECLARE(4, 0) PREDICT_M0_DECLARE(4, 1) PREDICT_M0_DECLARE(4, 2) PREDICT_M0_DECLARE(4, 3)
+#define PREDICT_M0_ROW(words, hp) \
+	{video_predict_m0_##words##_##hp##_0, video_predict_m0_##words##_##hp##_1, \
+	 video_predict_m0_##words##_##hp##_2, video_predict_m0_##words##_##hp##_3}
+
+namespace {
+	using PredictM0 = void (*)(uint8_t *, const uint8_t *, uint32_t, uint32_t);
+	// By words (2 or 4, as 0 or 1), half pel flags and source alignment
+	PredictM0 const s_predictM0[2][4][4] = {
+		{PREDICT_M0_ROW(2, 0), PREDICT_M0_ROW(2, 1), PREDICT_M0_ROW(2, 2), PREDICT_M0_ROW(2, 3)},
+		{PREDICT_M0_ROW(4, 0), PREDICT_M0_ROW(4, 1), PREDICT_M0_ROW(4, 2), PREDICT_M0_ROW(4, 3)},
+	};
+}
+#endif
+
 #if MD_MPEG_IDCT_M0
 extern "C" void video_idct_put_m0(int32_t *block, uint8_t *dest, uint32_t stride, uint32_t masks);
 extern "C" void video_idct_add_m0(int32_t *block, uint8_t *dest, uint32_t stride, uint32_t masks);
@@ -584,6 +610,13 @@ static void videoPredictBlock(uint8_t *d, const uint8_t *s, const uint32_t dw, c
 
 template <uint32_t SIZE, bool INTERPOLATE>
 void videoPredictBlockHalfPel(uint8_t *d, const uint8_t *s, const uint32_t dw, const uint32_t halfPel, const uint32_t rows) {
+#if MD_MPEG_PREDICT_M0
+	if constexpr (!INTERPOLATE) {
+		const uint32_t offset = reinterpret_cast<uintptr_t>(s) & 3;
+		s_predictM0[SIZE == 16][halfPel][offset](d, s - offset, dw, rows);
+		return;
+	}
+#endif
 	// halfPel is always 0..3
 	switch (halfPel) {
 		case 0: videoPredictBlock<SIZE, 0, INTERPOLATE>(d, s, dw, rows); break;

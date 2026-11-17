@@ -44,6 +44,7 @@ function(use_display name)
 endfunction()
 set(MD_MPEG_CLIP_DIR "" CACHE PATH "Directory holding clip.mpg, the clip to embed")
 option(MD_MPEG_IDCT_M0 "Use the Cortex-M0+ assembler IDCT, pico/idct_m0.S" ON)
+option(MD_MPEG_PREDICT_M0 "Use the Cortex-M0+ assembler motion compensation, pico/predict_m0.S" ON)
 option(MD_MPEG_SPARSE_IDCT "Skip the IDCT arithmetic for rows and columns with only a first coefficient" ON)
 # The Pico's audio output is mono
 option(MD_MPEG_AUDIO_MONO "Mix stereo audio to mono before the synthesis filter, halving its work" ON)
@@ -59,11 +60,18 @@ else()
 	set(MD_MPEG_PICO_VIDEO_RING_SIZE 16384)
 endif()
 
+# With NO_ASM, the decoder uses its C IDCT and prediction, while the assembler is still linked in
 function(add_decoder_app name main_source)
+	if("NO_ASM" IN_LIST ARGN)
+		set(use_asm 0)
+	else()
+		set(use_asm 1)
+	endif()
 	add_executable(${name}
 		${main_source}
 		clip.S
 		idct_m0.S
+		predict_m0.S
 		"${MD_MPEG_SRC}/mpeg1/Frame.cpp"
 		"${MD_MPEG_SRC}/mpeg1/Sequence.cpp"
 		"${MD_MPEG_SRC}/mpeg1/Mpeg1VideoDecoder.cpp"
@@ -73,7 +81,8 @@ function(add_decoder_app name main_source)
 	target_include_directories(${name} PRIVATE "${MD_MPEG_SRC}" "${MD_MPEG_SRC}/stream" "${MD_MPEG_SRC}/mpeg1")
 	target_compile_definitions(${name} PRIVATE
 		MD_MPEG_AUDIO_FIXED_POINT=1
-		MD_MPEG_IDCT_M0=$<BOOL:${MD_MPEG_IDCT_M0}>
+		MD_MPEG_IDCT_M0=$<AND:${use_asm},$<BOOL:${MD_MPEG_IDCT_M0}>>
+		MD_MPEG_PREDICT_M0=$<AND:${use_asm},$<BOOL:${MD_MPEG_PREDICT_M0}>>
 		MD_MPEG_SPARSE_IDCT=$<BOOL:${MD_MPEG_SPARSE_IDCT}>
 		MD_MPEG_AUDIO_MONO=$<BOOL:${MD_MPEG_AUDIO_MONO}>
 		MD_MPEG_ENABLE_MPEG2=$<BOOL:${MD_MPEG_ENABLE_MPEG2}>
@@ -97,6 +106,8 @@ function(add_decoder_app name main_source)
 endfunction()
 
 add_decoder_app(benchmark_flash benchmark.cpp)
+# Compares the assembler with the decoder's C on random data
+add_decoder_app(asm_test asm_test.cpp NO_ASM)
 # The benchmark also times converting frames for the screen
 use_display(benchmark_flash)
 option(MD_MPEG_PICO_AUDIO_ON_CORE1 "Decode audio on core 1, between frame scans, instead of on core 0" ON)
