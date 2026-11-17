@@ -43,6 +43,7 @@ function(use_display name)
 	target_link_libraries(${name} PRIVATE hardware_dma hardware_i2c hardware_spi)
 endfunction()
 set(MD_MPEG_CLIP_DIR "" CACHE PATH "Directory holding clip.mpg, the clip to embed")
+option(MD_MPEG_IDCT_M0 "Use the Cortex-M0+ assembler IDCT, pico/idct_m0.S" ON)
 option(MD_MPEG_SPARSE_IDCT "Skip the IDCT arithmetic for rows and columns with only a first coefficient" ON)
 # The Pico's audio output is mono
 option(MD_MPEG_AUDIO_MONO "Mix stereo audio to mono before the synthesis filter, halving its work" ON)
@@ -62,6 +63,7 @@ function(add_decoder_app name main_source)
 	add_executable(${name}
 		${main_source}
 		clip.S
+		idct_m0.S
 		"${MD_MPEG_SRC}/mpeg1/Frame.cpp"
 		"${MD_MPEG_SRC}/mpeg1/Sequence.cpp"
 		"${MD_MPEG_SRC}/mpeg1/Mpeg1VideoDecoder.cpp"
@@ -71,6 +73,7 @@ function(add_decoder_app name main_source)
 	target_include_directories(${name} PRIVATE "${MD_MPEG_SRC}" "${MD_MPEG_SRC}/stream" "${MD_MPEG_SRC}/mpeg1")
 	target_compile_definitions(${name} PRIVATE
 		MD_MPEG_AUDIO_FIXED_POINT=1
+		MD_MPEG_IDCT_M0=$<BOOL:${MD_MPEG_IDCT_M0}>
 		MD_MPEG_SPARSE_IDCT=$<BOOL:${MD_MPEG_SPARSE_IDCT}>
 		MD_MPEG_AUDIO_MONO=$<BOOL:${MD_MPEG_AUDIO_MONO}>
 		MD_MPEG_ENABLE_MPEG2=$<BOOL:${MD_MPEG_ENABLE_MPEG2}>

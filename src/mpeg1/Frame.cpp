@@ -7,6 +7,35 @@
 
 #include <cstring>
 
+// The Cortex-M0+ assembler IDCT, pico/idct_m0.S, which also stores the result and clears the block
+#ifndef MD_MPEG_IDCT_M0
+#define MD_MPEG_IDCT_M0 0
+#endif
+#if MD_MPEG_IDCT_M0
+extern "C" void video_idct_put_m0(int32_t *block, uint8_t *dest, uint32_t stride, uint32_t masks);
+extern "C" void video_idct_add_m0(int32_t *block, uint8_t *dest, uint32_t stride, uint32_t masks);
+
+namespace {
+	// For a coefficient's raster index, its column's bits in the masks video_idct_*_m0() take: bit 2j + 1
+	// for any coefficient in column j, and bit 2j for one below the first row. In RAM, for speed.
+	constexpr uint16_t idctMaskBits(const int index) {
+		return static_cast<uint16_t>((index >= 8 ? 3u : 2u) << (2 * (index & 7)));
+	}
+	struct IdctMasks {
+		uint16_t bits[64];
+		constexpr IdctMasks() : bits() {
+			for (int i = 0; i < 64; i++) {
+				bits[i] = idctMaskBits(i);
+			}
+		}
+	};
+	IdctMasks s_idctMasks;
+}
+#define IDCT_MASK(masks, index) masks |= s_idctMasks.bits[index]
+#else
+#define IDCT_MASK(masks, index)
+#endif
+
 #define PULL2(_v1, _b1, _v2, _b2) \
 	{ \
 	uint32_t t = m_bitStream.pull(_b1 + _b2); \
@@ -625,6 +654,7 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 		if (!(cbp & 0x40)) continue;
 		unsigned int n = 0;
 		uint8_t *quant_matrix;
+		[[maybe_unused]] uint32_t masks = 2;
 
 		//dout << "decodeBlock " << std::dec << "\n";
 		if (macroblock_intra) {
@@ -669,6 +699,8 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 
 			int de_zig_zagged = VIDEO_ZIG_ZAG[n];
 			n++;
+			masks = 0;
+			IDCT_MASK(masks, de_zig_zagged);
 
 			level = dequantizeMpeg1(level, false, quantizer_scale, quant_matrix[de_zig_zagged]);
 
@@ -692,6 +724,7 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 
 				int de_zig_zagged = VIDEO_ZIG_ZAG[n];
 				n++;
+				IDCT_MASK(masks, de_zig_zagged);
 
 				level = dequantizeMpeg1(level, macroblock_intra, quantizer_scale, quant_matrix[de_zig_zagged]);
 				// level is 12 bits, premul is 6bits = 18bits so block data has to be int32
@@ -735,9 +768,13 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 				BLOCK_SET(d, di, dw, si, 8, 8, clamped);
 				s[0] = 0;
 			} else {
+#if MD_MPEG_IDCT_M0
+				video_idct_put_m0(s, d + di, dw, masks);
+#else
 				video_idct(s);
 				BLOCK_SET(d, di, dw, si, 8, 8, clampToByte(s[si]));
 				memset(block_data, 0, sizeof(block_data));
+#endif
 			}
 		} else {
 			// Add data to the predicted macroblock
@@ -746,9 +783,13 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 				BLOCK_SET(d, di, dw, si, 8, 8, clampToByte(d[di] + value));
 				s[0] = 0;
 			} else {
+#if MD_MPEG_IDCT_M0
+				video_idct_add_m0(s, d + di, dw, masks);
+#else
 				video_idct(s);
 				BLOCK_SET(d, di, dw, si, 8, 8, clampToByte(d[di] + s[si]));
 				memset(block_data, 0, sizeof(block_data));
+#endif
 			}
 		}
 	}
