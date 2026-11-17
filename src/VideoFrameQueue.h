@@ -16,6 +16,8 @@ class VideoFrameQueue {
 public:
 	struct QueuedFrame {
 		int64_t ptsMs = 0;
+		// Time on the file's timeline (see MpegProgramStream::timelineMillis), -1 if not known
+		int64_t timelineMs = -1;
 		uint32_t width = 0;
 		uint32_t height = 0;
 		std::unique_ptr<uint32_t[]> rgb;
@@ -35,7 +37,7 @@ public:
 	 * Adds a frame to the back of the queue.
 	 * @return RGB buffer of width * height pixels for the caller to fill
 	 */
-	uint32_t *push(const int64_t ptsMs, const uint32_t width, const uint32_t height) {
+	uint32_t *push(const int64_t ptsMs, const uint32_t width, const uint32_t height, const int64_t timelineMs = -1) {
 		QueuedFrame frame;
 		if (!m_spare.empty()) {
 			frame = std::move(m_spare.back());
@@ -47,6 +49,7 @@ public:
 			frame.capacity = pixels;
 		}
 		frame.ptsMs = ptsMs;
+		frame.timelineMs = timelineMs;
 		frame.width = width;
 		frame.height = height;
 		m_frames.push_back(std::move(frame));

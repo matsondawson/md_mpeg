@@ -21,7 +21,7 @@
 #include "stream/FileStream.h"
 #include "mpeg1/MpegProgramStream.h"
 #include "mpeg1/Mpeg1VideoDecoder.h"
-#include "mpeg1/Mpeg1AudioDecoder.h"
+#include "mpeg1/AudioDecoders.h"
 
 namespace fs = std::filesystem;
 
@@ -89,7 +89,7 @@ struct Pipeline {
 	MStream::FileStreamRead file;
 	Mpeg1::MpegProgramStream demux;
 	Mpeg1VideoDecoder video;
-	Mpeg1AudioDecoder audio;
+	AudioDecoders audio;
 	DisplayTimestamper timestamper;
 
 	int frames = 0;
@@ -102,13 +102,14 @@ struct Pipeline {
 	uint64_t audioValues = 0; // sample values decoded (samples x channels)
 	uint32_t audioFrequency = 0, audioChannels = 0;
 	std::vector<AudioSample> audioSamples; // in decoder order: stereo is 32 left, 32 right, ...
+	std::vector<int64_t> timelinePts; // pictures with a PTS: their time on the file's timeline
 
 	bool finished = false;
 	bool threw = false;
 
 	explicit Pipeline(const fs::path &path) : file(path.c_str()) {
 		demux.setVideoDecoder(&video);
-		demux.setAudioDecoder(&audio);
+		audio.attach(demux);
 		const auto [endPackPosition, endScrMillis] = Mpeg1::findLastPack(file);
 		demux.setEndPack(endPackPosition, endScrMillis);
 		video.setFrameCallback([this](const Frame &frame) {
@@ -119,6 +120,9 @@ struct Pipeline {
 			}
 			frames++;
 			displayPts.push_back(pts);
+			if (frame.m_ptsMillis >= 0) {
+				timelinePts.push_back(demux.timelineMillis(frame.m_ptsMillis));
+			}
 			streamPts.push_back(frame.m_ptsMillis);
 			width = video.m_width;
 			height = video.m_height;
@@ -166,7 +170,19 @@ struct Pipeline {
 		std::cout << "  gave up: decoding didn't finish (hang?)" << std::endl;
 	}
 
-	// Same sequence the player uses
+	// Same sequence the player uses, to a time on the file's timeline (needs demux.buildTimeline)
+	void seekToTimeline(const int64_t targetMs) {
+		const int64_t position = demux.findTimelinePosition(file, targetMs);
+		CHECK(position >= 0);
+		file.seek(position);
+		demux.reset();
+		demux.setInputPosition(position);
+		video.reset();
+		audio.reset();
+		timestamper.reset();
+	}
+
+	// Same sequence the player used before timelines, to a PTS
 	void seekTo(const int64_t targetMs) {
 		const int64_t position = std::min<int64_t>(demux.estimateBytePosition(targetMs),
 		                                           static_cast<int64_t>(file.size()));
@@ -276,11 +292,15 @@ static void testVideoOnly() {
 // The decoded waveform, including its level and polarity, must match ffmpeg's decode. With MD_MPEG_AUDIO_MONO
 // a stereo clip must match the average of ffmpeg's two channels.
 static constexpr double MIN_SNR_DB = 55.0;
+// A/52 fills bits with no mantissa bits with random noise, differently from ffmpeg
+static constexpr double MIN_A52_SNR_DB = 35.0;
 
-static void checkAudioMatchesFfmpeg(const fs::path &clip, const std::string &referenceName, const uint32_t channels) {
+static void checkAudioMatchesFfmpeg(const fs::path &clip, const std::string &referenceName, const uint32_t channels,
+                                    const double minSnrDb = MIN_SNR_DB, const std::string &decoderOptions = "") {
 	const auto reference = media(referenceName);
 	if (!fs::exists(reference)) {
-		run("ffmpeg -nostdin -y -i \"" + clip.string() + "\" -vn -f s16le -acodec pcm_s16le \"" + reference.string() + "\"");
+		run("ffmpeg -nostdin -y " + decoderOptions + " -i \"" + clip.string() + "\" -vn -f s16le -acodec pcm_s16le \""
+		    + reference.string() + "\"");
 	}
 	const auto bytes = readFile(reference);
 	const auto p = decode(clip);
@@ -314,7 +334,7 @@ static void checkAudioMatchesFfmpeg(const fs::path &clip, const std::string &ref
 	if (sumReference > 0) {
 		const double snrDb = sumError > 0 ? 10.0 * std::log10(sumReference / sumError) : 200.0;
 		std::cout << "  " << referenceName << ": " << snrDb << " dB from ffmpeg" << std::endl;
-		CHECK(snrDb >= MIN_SNR_DB);
+		CHECK(snrDb >= minSnrDb);
 	}
 }
 
@@ -621,6 +641,177 @@ static void testMpeg2Seek() {
 		checkSteps(p.displayPts, index, 39, 41);
 	}
 }
+
+// Decoding that starts mid-stream, like a .vob that isn't the first of a title: the first group's B-pictures, and
+// any picture predicted from one that wasn't decoded, have reference pictures that were never decoded
+static void testMpeg2StartMidStream() {
+	const auto data = readFile(generate("m2long.vob", VIDEO_320 + " " + TONE + " -t 20 -c:v mpeg2video -bf 2 -g 12 -c:a mp2",
+	                                    "vob"));
+	for (const size_t start: {data.size() * 2 / 5, data.size() / 2 + 777}) {
+		const auto p = decode(writeFile("m2midstream.vob", std::vector<uint8_t>(data.begin() + static_cast<std::ptrdiff_t>(start), data.end())));
+		CHECK(p->finished);
+		CHECK(!p->threw);
+		CHECK_RANGE(p->frames, 200, 300);
+		// Audio starting mid-frame isn't mistaken for an unsupported format
+		CHECK(p->audioSeconds() > 9.0);
+	}
+	// Two clips of different sizes joined: the second's first pictures can't predict from the first's
+	auto joined = readFile(generate("m2long.vob", ""));
+	const auto other = readFile(generate("m2interlaced.vob", ""));
+	joined.insert(joined.end(), other.begin() + static_cast<std::ptrdiff_t>(other.size() / 3), other.end());
+	const auto p = decode(writeFile("m2sizes.vob", joined));
+	CHECK(p->finished);
+	CHECK(!p->threw);
+}
+
+// ---------------------------------------------------------------- A/52 audio
+
+// ffmpeg's A/52 encoder
+static const std::string A52 = " -c:a ac3";
+static const std::string STEREO_SWEEP = "-f lavfi -i \"aevalsrc=0.9*sin(2*PI*(200+2000*t)*t)|0.9*random(0)-0.45:s=48000\"";
+
+static void testA52Audio() {
+	const auto stereo = generate("a52stereo.vob", VIDEO_320 + " " + STEREO_SWEEP + " -t 3 -c:v mpeg2video" + A52 + " -b:a 384k",
+	                             "vob");
+	checkAudioMatchesFfmpeg(stereo, "a52stereo.pcm", 2, MIN_A52_SNR_DB);
+	const auto p = decode(stereo);
+	CHECK(p->frames == 75);
+	CHECK_RANGE(p->audioSeconds(), 2.9, 3.1);
+	CHECK_RANGE(p->audio.firstFramePtsMillis() - p->displayPts.front(), -50, 50);
+
+	// Mono, 44.1 kHz, low bit rate: coupling isn't possible, few bits per mantissa
+	const auto mono = generate("a52mono.vob", TONE + " -t 3" + A52 + " -b:a 64k", "vob");
+	checkAudioMatchesFfmpeg(mono, "a52mono.pcm", 1, MIN_A52_SNR_DB);
+	// Stereo at a low bit rate, which uses coupling
+	const auto coupled = generate("a52coupled.vob", STEREO_SWEEP + " -t 3" + A52 + " -b:a 96k", "vob");
+	checkAudioMatchesFfmpeg(coupled, "a52coupled.pcm", 2, MIN_A52_SNR_DB);
+	// 32 kHz, with short blocks from the clicks
+	const auto clicks = generate("a52clicks.vob", "-f lavfi -i \"aevalsrc=0.8*lt(mod(t\\,0.25)\\,0.01)*sin(2*PI*3000*t)"
+	                                              "|0.5*sin(2*PI*300*t):s=32000\" -t 3" + A52 + " -b:a 256k", "vob");
+	checkAudioMatchesFfmpeg(clicks, "a52clicks.pcm", 2, MIN_A52_SNR_DB);
+}
+
+// 5.1 is downmixed to stereo like ffmpeg's decoder does it
+static void testA52Downmix() {
+	const auto clip = generate("a52surround.vob", "-f lavfi -i \"aevalsrc=0.5*sin(2*PI*300*t)|0.5*sin(2*PI*500*t)"
+	                                              "|0.5*sin(2*PI*700*t)|0.3*sin(2*PI*50*t)|0.5*sin(2*PI*1100*t)"
+	                                              "|0.5*sin(2*PI*1300*t):s=48000:c=5.1\" -t 3" + A52 + " -b:a 448k", "vob");
+	checkAudioMatchesFfmpeg(clip, "a52surround.pcm", 2, MIN_A52_SNR_DB, "-downmix stereo");
+}
+
+static void testA52Mpeg1System() {
+	const auto clip = generate("a52system.mpg", VIDEO_320 + " " + TONE + " -t 2 -c:v mpeg1video" + A52);
+	const auto p = decode(clip);
+	CHECK(p->finished);
+	CHECK(p->frames == 50);
+	CHECK_RANGE(p->audioSeconds(), 1.9, 2.1);
+}
+
+static void testA52Corrupt() {
+	auto data = readFile(generate("a52long.vob", VIDEO_320 + " " + TONE + " -t 20 -c:v mpeg2video -bf 2 -g 12" + A52,
+	                              "vob"));
+	uint32_t seed = 4321;
+	auto random = [&seed] { seed = seed * 1103515245 + 12345; return seed >> 8; };
+	for (int i = 0; i < 300; i++) {
+		data[data.size() / 10 + random() % (data.size() * 8 / 10)] = static_cast<uint8_t>(random());
+	}
+	const auto p = decode(writeFile("a52corrupt.vob", data));
+	CHECK(p->finished);
+	CHECK(!p->threw);
+	CHECK(p->audioSeconds() > 15.0);
+}
+
+// Relabels A/52 sub-stream from as to in a DVD-style program stream
+static void relabelA52(std::vector<uint8_t> &data, const uint8_t from, const uint8_t to) {
+	for (size_t i = 0; i + 16 < data.size(); i++) {
+		if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0xBD && (data[i + 6] >> 6) == 2) {
+			const size_t sub = i + 9 + data[i + 8];
+			if (sub < data.size() && data[sub] == from) {
+				data[sub] = to;
+			}
+		}
+	}
+}
+
+// Frequency of a decoded tone from its zero crossings (first channel of stereo)
+static double toneFrequency(const Pipeline &p) {
+	int crossings = 0;
+	size_t samples = 0;
+	AudioSample previous = 0;
+	for (size_t i = 0; i < p.audioSamples.size(); i++) {
+		if (p.audioChannels == 2 && (i / 32) % 2) {
+			continue;
+		}
+		const AudioSample sample = p.audioSamples[i];
+		crossings += (previous < 0) != (sample < 0);
+		previous = sample;
+		samples++;
+	}
+	return p.audioFrequency ? crossings / 2.0 / (static_cast<double>(samples) / p.audioFrequency) : 0;
+}
+
+// A file holding two programs whose audio is on different sub-streams, like DVD .vob files with an intro: the
+// second program's audio takes over when the first's stops
+static void testA52StreamChange() {
+	auto first = readFile(generate("a52intro.vob", VIDEO_320 + " " + TONE + " -t 4 -c:v mpeg2video" + A52, "vob"));
+	relabelA52(first, 0x80, 0x84);
+	const auto second = readFile(generate("a52long.vob", ""));
+	first.insert(first.end(), second.begin(), second.end());
+	const auto p = decode(writeFile("a52programs.vob", first));
+	CHECK(p->finished);
+	CHECK_RANGE(p->audioSeconds(), 22.5, 24.5);
+}
+
+// Of several audio streams, the lowest numbered (usually the main soundtrack) is played
+static void testA52LowestStream() {
+	// DVD audio is always 48 kHz; the output can't change sample rate
+	auto data = readFile(generate("a52tracks48.vob", VIDEO_320 + " -f lavfi -i sine=frequency=440:sample_rate=48000"
+	                                                 " -f lavfi -i sine=frequency=1000:sample_rate=48000"
+	                                               " -map 0:v -map 1:a -map 2:a -t 4 -c:v mpeg2video" + A52, "vob"));
+	// The first track (440 Hz) becomes 0x83, the second (1000 Hz) 0x80
+	relabelA52(data, 0x80, 0x83);
+	relabelA52(data, 0x81, 0x80);
+	const auto p = decode(writeFile("a52tracksrelabelled.vob", data));
+	CHECK(p->finished);
+	CHECK_RANGE(p->audioSeconds(), 3.5, 4.5);
+	CHECK_RANGE(toneFrequency(*p), 950.0, 1050.0);
+}
+
+// Seeking in a file of several programs, each with its SCR and PTS starting again
+static void testTimelineSeek() {
+	const auto clip = readFile(generate("a52long.vob", ""));
+	std::vector<uint8_t> data;
+	for (int i = 0; i < 3; i++) {
+		data.insert(data.end(), clip.begin(), clip.end());
+	}
+	const auto path = writeFile("programs.vob", data);
+	Pipeline p(path);
+	p.demux.buildTimeline(p.file);
+	CHECK_RANGE(p.demux.timelineDurationMillis(), 58500, 61000);
+	for (const int64_t target: {5000, 25000, 45000, 15000}) {
+		p.seekToTimeline(target);
+		const size_t index = p.timelinePts.size();
+		p.runUntil(p.frames + 10);
+		CHECK(p.timelinePts.size() > index);
+		if (p.timelinePts.size() > index) {
+			CHECK_RANGE(p.timelinePts[index], target - 1500, target + 1500);
+		}
+		CHECK(p.audio.firstFramePtsMillis() >= 0);
+	}
+}
+
+static void testA52Seek() {
+	const auto clip = generate("a52long.vob", VIDEO_320 + " " + TONE + " -t 20 -c:v mpeg2video -bf 2 -g 12" + A52, "vob");
+	Pipeline p(clip);
+	p.runUntil(50);
+	p.seekTo(12000);
+	const size_t index = p.displayPts.size();
+	p.runUntil(p.frames + 10);
+	CHECK(p.displayPts.size() > index);
+	CHECK_RANGE(p.audio.firstFramePtsMillis(), 10500, 13500);
+	p.runUntil();
+	CHECK(p.finished);
+}
 #endif
 
 int main(int argc, char *argv[]) {
@@ -653,6 +844,15 @@ int main(int argc, char *argv[]) {
 		{"mpeg-2 in mixed system layers", testMpeg2MixedLayers},
 		{"mpeg-2 dual prime", testMpeg2DualPrime},
 		{"mpeg-2 seek", testMpeg2Seek},
+		{"mpeg-2 starting mid-stream", testMpeg2StartMidStream},
+		{"a/52 audio", testA52Audio},
+		{"a/52 downmix", testA52Downmix},
+		{"a/52 in an mpeg-1 system stream", testA52Mpeg1System},
+		{"a/52 corrupt", testA52Corrupt},
+		{"a/52 seek", testA52Seek},
+		{"a/52 stream change", testA52StreamChange},
+		{"a/52 lowest numbered stream", testA52LowestStream},
+		{"seek across programs", testTimelineSeek},
 #endif
 	};
 	for (const auto &[name, test] : tests) {

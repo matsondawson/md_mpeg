@@ -185,6 +185,16 @@ void Frame::init(const int32_t ptsMillis, const FrameSize frameSize) {
 	m_ptsMillis = ptsMillis;
 }
 
+void Frame::ensureSize(const FrameSize frameSize) {
+	if (frameSize == m_frameSize) {
+		return;
+	}
+	init(-1, frameSize);
+	std::memset(m_yData, 16, frameSize.luma_width * frameSize.luma_height);
+	std::memset(m_cbData, 128, frameSize.chroma_width * frameSize.chroma_height);
+	std::memset(m_crData, 128, frameSize.chroma_width * frameSize.chroma_height);
+}
+
 uint32_t Mpeg1VideoDecoder::decodeFrame() {
 	// PTS of this picture's start code, -1 if it has none (presentation time is then extrapolated)
 #if MD_MPEG_ENABLE_MPEG2
@@ -195,6 +205,8 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 #else
 	m_ptrFrameCurrent->init(m_stream.getPts(0), m_frameSize);
 #endif
+	m_ptrFramePast->ensureSize(m_frameSize);
+	m_ptrFrameFuture->ensureSize(m_frameSize);
 
 	uint32_t m_temporal_reference;
 	PULL2dump1(m_temporal_reference, 10, picture_coding_type, 3, 16);

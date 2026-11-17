@@ -43,5 +43,8 @@ public:
 	Frame& operator=(const Frame&) = delete;
 
 	void init(int32_t ptsMillis, FrameSize frameSize);
+	// For a reference picture that wasn't decoded at this size: decoding started mid-stream, or the size changed.
+	// Allocates it at the size, black, so predictions from it read valid memory.
+	void ensureSize(FrameSize frameSize);
 };
 

@@ -145,6 +145,16 @@ namespace MStream {
 			return result;
 		}
 
+		// The byte offset bytes after the next one to be read, without consuming anything. offset < used().
+		[[nodiscard]] uint8_t peekAt(const uint32_t offset) const {
+			assert(offset < used());
+			uint32_t index = m_readIndex + offset;
+			if (index >= size()) {
+				index -= size();
+			}
+			return m_buffer[index];
+		}
+
 		// TODO optimize
 		void skip(uint32_t bytes) {
 			while (bytes--) {

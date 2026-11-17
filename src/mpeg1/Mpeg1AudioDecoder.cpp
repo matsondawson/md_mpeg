@@ -51,6 +51,15 @@ void Mpeg1AudioDecoder::flush() {
     m_stream.flush();
 }
 
+void Mpeg1AudioDecoder::discontinuity() {
+    if (hasPendingFrame()) {
+        return; // a complete frame waiting for output space is kept
+    }
+    resync();
+    m_resyncSkippedBytes = 0;
+    m_expectResync = true;
+}
+
 static constexpr uint32_t AUDIO_MPEG_2_5 = 0x0;
 static constexpr uint32_t AUDIO_MPEG_2 = 0x2;
 static constexpr uint32_t AUDIO_MPEG_1 = 0x3;
@@ -400,11 +409,8 @@ bool Mpeg1AudioDecoder::isValidHeader(const uint32_t header) {
         return false;
     }
     if (version != AUDIO_MPEG_1 || layer != AUDIO_LAYER_II) {
-        // Several of these before any valid frame means the stream is another format (e.g. MP3).
-        // Disable audio rather than risk decoding noise from data that happens to look like a header.
-        if (!m_hasLoggedHeaderInfo && ++m_unsupportedHeaderCount == 3) {
-            m_audioDisabled = true;
-            std::cout << "Unsupported audio format, only MPEG-1 Layer II is supported. Audio disabled." << std::endl;
+        if (!m_hasLoggedHeaderInfo) {
+            noteUnsupportedHeader(header);
         }
         return false;
     }
@@ -419,6 +425,64 @@ bool Mpeg1AudioDecoder::isValidHeader(const uint32_t header) {
         return false;
     }
     return true;
+}
+
+/**
+ * Three frames of another format back to back, each header where the previous frame ends, before any valid frame
+ * means the stream is another format (e.g. MP3). Audio is then disabled rather than risk decoding noise from data
+ * that happens to look like a header. Single headers don't count: data that starts mid-frame, like a file cut from
+ * the middle of a stream, can look like a few of them.
+ */
+void Mpeg1AudioDecoder::noteUnsupportedHeader(const uint32_t header) {
+    // Bit rates in kbit/s by version (MPEG-1, or MPEG-2 and 2.5) and layer (I, II, III)
+    static constexpr uint16_t BIT_RATES[2][3][15] = {
+        {
+            {0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448},
+            {0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384},
+            {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320},
+        },
+        {
+            {0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256},
+            {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},
+            {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},
+        },
+    };
+    // Sample rates by version code (2.5, reserved, 2, 1)
+    static constexpr uint32_t SAMPLE_RATES[4][3] = {
+        {11025, 12000, 8000}, {0, 0, 0}, {22050, 24000, 16000}, {44100, 48000, 32000}
+    };
+    const auto version = (header >> 19) & 3;
+    const auto layer = (header >> 17) & 3;
+    const auto bitRateIndex = (header >> 12) & 15;
+    const auto samplingFrequencyIndex = (header >> 10) & 3;
+    const auto padding = (header >> 9) & 1;
+    if (version == 1 || layer == 0 || bitRateIndex == 0 || bitRateIndex == 15 || samplingFrequencyIndex == 3) {
+        return; // reserved or free format: not a header we can follow
+    }
+    const uint32_t bitRate = BIT_RATES[version == AUDIO_MPEG_1 ? 0 : 1][3 - layer][bitRateIndex] * 1000;
+    const uint32_t sampleRate = SAMPLE_RATES[version][samplingFrequencyIndex];
+    uint32_t frameBytes;
+    if (layer == AUDIO_LAYER_I) {
+        frameBytes = (12 * bitRate / sampleRate + padding) * 4;
+    } else if (layer == AUDIO_LAYER_III && version != AUDIO_MPEG_1) {
+        frameBytes = 72 * bitRate / sampleRate + padding;
+    } else {
+        frameBytes = 144 * bitRate / sampleRate + padding;
+    }
+
+    // Version, layer and sample rate, which stay the same from frame to frame
+    const uint32_t format = version << 4 | layer << 2 | samplingFrequencyIndex;
+    if (m_unsupportedFrameRun && m_searchPosition == m_unsupportedFrameEnd && format == m_unsupportedFormat) {
+        m_unsupportedFrameRun++;
+    } else {
+        m_unsupportedFrameRun = 1;
+    }
+    m_unsupportedFormat = format;
+    m_unsupportedFrameEnd = m_searchPosition + frameBytes;
+    if (m_unsupportedFrameRun == 3) {
+        m_audioDisabled = true;
+        std::cout << "Unsupported audio format, only MPEG-1 Layer II is supported. Audio disabled." << std::endl;
+    }
 }
 
 /**
@@ -458,6 +522,7 @@ void Mpeg1AudioDecoder::decodeHeader() {
     if (!isValidHeader(m_stream.peek(4))) {
         m_stream.skip(1);
         m_resyncSkippedBytes++;
+        m_searchPosition++;
         return;
     }
     if (m_resyncSkippedBytes && !m_expectResync) {

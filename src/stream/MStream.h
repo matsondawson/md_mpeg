@@ -44,6 +44,9 @@ namespace MStream {
 		virtual void executeCallbacks() = 0;
 		// End of input
 		virtual void flush() = 0;
+		// The data written next doesn't continue what was written before (e.g. another audio stream takes over)
+		virtual void discontinuity() {
+		}
 	};
 
 	/*
