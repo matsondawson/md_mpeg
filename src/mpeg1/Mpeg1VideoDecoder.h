@@ -47,9 +47,11 @@ class Mpeg1VideoDecoder final : public MStream::IWriteByteStream
 	std::function<void(const Frame &frame)> m_frameCallback;
 
 public:
-	MStream::RingBufferWithStartCodeEvent<MD_MPEG_VIDEO_RING_SIZE, PICTURE_START_CODE> m_stream;
+	using Stream = MStream::RingBufferWithStartCodeEvent<MD_MPEG_VIDEO_RING_SIZE, PICTURE_START_CODE>;
+	using BitStream = MStream::BasicReadBitStream<Stream>;
+	Stream m_stream;
 private:
-	MStream::ReadBitStream m_bitStream;
+	BitStream m_bitStream;
 
 	uint32_t next_start_code;
 	uint32_t last_start_code;

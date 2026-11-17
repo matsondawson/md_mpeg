@@ -198,7 +198,7 @@ namespace {
 	constexpr IntraVlc1Tables INTRA_VLC1 = buildIntraVlc1Tables();
 
 	// Reads dmvector: 0, '10' 1, '11' -1
-	int32_t pullDmVector(MStream::ReadBitStream &bitStream) {
+	int32_t pullDmVector(Mpeg1VideoDecoder::BitStream &bitStream) {
 		if (!bitStream.pull(1)) {
 			return 0;
 		}

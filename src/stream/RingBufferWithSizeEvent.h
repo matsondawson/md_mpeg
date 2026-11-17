@@ -16,7 +16,7 @@ namespace MStream {
 	 * calls executeCallbacks(), which runs the callback when exactly that many are buffered.
 	 */
 	template<uint32_t RingBufferSize>
-	class RingBufferWithSizeEvent : public IWriteByteStream, public IReadByteStream {
+	class RingBufferWithSizeEvent final : public IWriteByteStream, public IReadByteStream {
 		// PTS of the latest packet, -1 if none yet
 		int32_t m_ptsMillis;
 
