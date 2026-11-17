@@ -433,6 +433,9 @@ InputEvents ScreenContextRgbSDL::eventLoop() {
 					case SDLK_N:
 						input.skip = true;
 						break;
+					case SDLK_D:
+						input.toggleDeinterlace = true;
+						break;
 					case SDLK_ESCAPE:
 					case SDLK_Q:
 						input.quit = true;

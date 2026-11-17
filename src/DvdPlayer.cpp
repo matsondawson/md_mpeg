@@ -5,6 +5,7 @@
 #if MD_MPEG_ENABLE_MPEG2
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -137,7 +138,8 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path, const bool skipIn
 			return;
 		}
 		clock.startAt(frameQueue.front().ptsMs);
-		if (!frameQueue.frontIsDue(clock.ms())) {
+		VideoFrameQueue::Show show;
+		if (!frameQueue.nextToShow(clock.ms(), show)) {
 			return;
 		}
 		const auto &frame = frameQueue.front();
@@ -151,8 +153,9 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path, const bool skipIn
 		}
 		shownWidth = frame.width;
 		shownHeight = frame.height;
-		shownFrame.assign(frame.rgb.get(), frame.rgb.get() + static_cast<size_t>(frame.width) * frame.height);
-		frameQueue.pop();
+		shownFrame.resize(static_cast<size_t>(frame.width) * frame.height);
+		frameQueue.render(show, shownFrame.data());
+		frameQueue.presented(show);
 		drawPicture();
 	};
 
@@ -173,6 +176,9 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path, const bool skipIn
 			}
 		}
 		video->generateRgbFrameData(frameQueue.push(ptsMs, frame.m_width, frame.m_height, frame.m_aspectRatio), frame);
+		if (frame.m_interlaced) {
+			frameQueue.setInterlaced(frame.m_topFieldFirst, std::lround(video->m_frame_period_millis / 2));
+		}
 	});
 
 	audio.setFrameCallback([&](const uint32_t frequency, const uint32_t channels, AudioSampleBuffer *soundBuffer) {
@@ -340,6 +346,14 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path, const bool skipIn
 		// --- input
 		const auto input = sdl.eventLoop();
 		quit |= input.quit;
+		if (input.toggleDeinterlace) {
+			// Yadif, off, bob, yadif...
+			const auto mode = frameQueue.deinterlaceMode();
+			frameQueue.setDeinterlaceMode(mode == Deinterlace::Mode::Yadif ? Deinterlace::Mode::Off
+			                              : mode == Deinterlace::Mode::Off ? Deinterlace::Mode::Bob
+			                              : Deinterlace::Mode::Yadif);
+			std::cout << "Deinterlacing: " << Deinterlace::name(frameQueue.deinterlaceMode()) << std::endl;
+		}
 		if (input.togglePause) {
 			const bool paused = !clock.paused();
 			clock.setPaused(paused);

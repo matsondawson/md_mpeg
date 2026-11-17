@@ -51,6 +51,8 @@ struct InputEvents {
 	int chapterSkip = 0;
 	// N: skip what is playing on a DVD (e.g. a warning), to where the disc goes after it
 	bool skip = false;
+	// D: the next way of deinterlacing interlaced video (yadif, off, bob)
+	bool toggleDeinterlace = false;
 	// Mouse over the picture: its position in picture pixels, and whether it was clicked (not on the control bar)
 	bool mouseMoved = false;
 	bool mouseClicked = false;

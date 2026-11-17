@@ -25,6 +25,7 @@ option(MD_MPEG_ENABLE_MPEG2 "Decode MPEG-2 video and program streams, and A/52 a
 # Demuxing and decoding, no SDL dependency. Shared by the player and the tests.
 add_library(md_mpeg_core STATIC
 	"src/Time.cpp"
+	"src/Deinterlace.cpp"
 	"src/mpeg1/Frame.cpp"
 	"src/mpeg1/Sequence.cpp"
 	"src/mpeg1/Mpeg1VideoDecoder.cpp"

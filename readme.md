@@ -11,6 +11,11 @@ This is a C++ application for playing MPEG1 and MPEG2 video with MP2, A/52 or LP
   chosen by the keyboard or mouse.
 - Supports MPEG-1 and MPEG-2 program streams (`.mpg`, `.vob`), detected per file.
 - MPEG2 main profile video: progressive and interlaced, frame and field pictures, 3:2 pulldown timing.
+- Interlaced frames are deinterlaced: each field is shown on its own, at full height, at twice the frame rate (50 or
+  60 per second), so motion is smooth without combing. The default, yadif, is motion adaptive: still areas keep
+  the other field's lines, so still detail such as titles stays sharp and steady, and moving areas are
+  interpolated. D cycles through yadif, off (both fields at once) and bob (every field interpolated from its own
+  lines). See `src/Deinterlace.h`.
 - Audio/video sync using the audio as the master clock; falls back to the wall clock for files with no audio, or once the audio ends.
 - Late video frames are dropped to keep up with the audio.
 
@@ -81,6 +86,7 @@ follows the disc's own commands for what comes next. Pass `--no-skip` to play th
 | Key | Action |
 |---|---|
 | Space or P | Pause / resume |
+| D | Deinterlacing: yadif (the default), off, bob |
 | Left / Right | Seek back / forward 10 seconds |
 | Down / Up | Seek back / forward 60 seconds |
 | Escape or Q | Quit |
@@ -132,8 +138,8 @@ cmake -S . -B build -DMD_MPEG_ENABLE_MPEG2=OFF
 ```
 
 Without CMake, define it as 0 or 1 on the compiler command line; it must be the same for every file that
-includes the decoder headers. Only 4:2:0 video is supported (not the 4:2:2 profile). Interlaced pictures are
-shown as whole frames, without deinterlacing.
+includes the decoder headers. Only 4:2:0 video is supported (not the 4:2:2 profile). MPEG-1 has no interlaced
+pictures, so nothing is deinterlaced without MPEG-2.
 
 The same option enables the A/52 audio decoder, written from the ATSC A/52 standard (published as ETSI TS 102 366),
 for A/52 audio in private stream 1 of a program stream. All channel layouts are decoded: 3 to 5 channels are

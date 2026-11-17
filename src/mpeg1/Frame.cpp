@@ -257,11 +257,20 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 		auto &fields = m_ptrFrameCurrent->m_fields;
 		if (m_pictureStructure != FRAME_PICTURE) {
 			fields = 2;
+			if (!m_secondField) {
+				// Two field pictures: the first one decoded is shown first
+				m_ptrFrameCurrent->m_interlaced = !m_progressiveFrame;
+				m_ptrFrameCurrent->m_topFieldFirst = m_pictureStructure == TOP_FIELD;
+			}
 		} else if (m_progressiveSequence) {
 			// repeat_first_field repeats the whole frame, twice if top_field_first
 			fields = m_repeatFirstField ? (m_topFieldFirst ? 6 : 4) : 2;
 		} else {
 			fields = m_repeatFirstField ? 3 : 2;
+		}
+		if (m_pictureStructure == FRAME_PICTURE) {
+			m_ptrFrameCurrent->m_interlaced = !m_progressiveSequence && !m_progressiveFrame;
+			m_ptrFrameCurrent->m_topFieldFirst = m_topFieldFirst;
 		}
 		while (nextStartCodeRange(SLICE_START_CODE_START, SLICE_START_CODE_END)) {
 			processSliceMpeg2(lastStartCode() & 255);
@@ -269,6 +278,7 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 		return m_temporal_reference;
 	}
 	m_ptrFrameCurrent->m_fields = 2;
+	m_ptrFrameCurrent->m_interlaced = false;
 #endif
 
 	while (nextStartCodeRange(SLICE_START_CODE_START, SLICE_START_CODE_END)) {

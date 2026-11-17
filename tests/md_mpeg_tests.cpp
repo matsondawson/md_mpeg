@@ -19,6 +19,7 @@
 
 #include "AudioStallDetector.h"
 #include "DisplayTimestamper.h"
+#include "VideoFrameQueue.h"
 #include "stream/FileStream.h"
 #include "mpeg1/MpegProgramStream.h"
 #include "mpeg1/Mpeg1VideoDecoder.h"
@@ -682,6 +683,151 @@ static void testMpeg2Interlaced() {
 	                                                        " -flags +ildct+ilme -bf 2 -g 12 -an", "vob"), 50, true);
 }
 
+// Interlaced frames are flagged with their field order; progressive ones aren't
+static void testInterlaceFlags() {
+	const auto flags = [](const fs::path &clip, int &interlaced, int &topFirst) {
+		interlaced = topFirst = 0;
+		if (!fs::exists(clip)) {
+			g_failures++;
+			std::cout << "  missing " << clip << std::endl;
+			return 0;
+		}
+		MStream::FileStreamRead file(clip.c_str());
+		Mpeg1::MpegProgramStream demux;
+		Mpeg1VideoDecoder video;
+		demux.setVideoDecoder(&video);
+		int frames = 0;
+		video.setFrameCallback([&](const Frame &frame) {
+			frames++;
+			interlaced += frame.m_interlaced;
+			topFirst += frame.m_interlaced && frame.m_topFieldFirst;
+		});
+		for (int i = 0; i < 1000000 && demux.nextPacket(file) != Mpeg1::DemuxResult::EndOfStream; i++) {
+		}
+		return frames;
+	};
+	// Made by the MPEG-2 tests
+	int interlaced, topFirst;
+	CHECK(flags(media("m2interlaced.vob"), interlaced, topFirst) == 50);
+	CHECK(interlaced == 50 && topFirst == 50);
+	CHECK(flags(media("m2interlacedbff.vob"), interlaced, topFirst) == 50);
+	CHECK(interlaced == 50 && topFirst == 0);
+	CHECK(flags(media("m2.vob"), interlaced, topFirst) > 0);
+	CHECK(interlaced == 0);
+}
+
+// Bob: an interlaced frame shows its fields one after the other, each at full height
+static void testBobDeinterlace() {
+	// One pixel wide, a line of each field in turn
+	const uint32_t woven[] = {0x00000000, 0x10101010, 0x20202020, 0x30303030};
+	uint32_t out[4];
+	Deinterlace::bobField(woven, out, 1, 4, true);
+	CHECK(out[0] == 0x00000000 && out[1] == 0x10101010 && out[2] == 0x20202020 && out[3] == 0x20202020);
+	Deinterlace::bobField(woven, out, 1, 4, false);
+	CHECK(out[0] == 0x10101010 && out[1] == 0x10101010 && out[2] == 0x20202020 && out[3] == 0x30303030);
+	// Each byte averaged on its own, rounding up
+	const uint32_t bytes[] = {0x01FF0080, 0, 0x02FFFF81};
+	uint32_t averaged[3];
+	Deinterlace::bobField(bytes, averaged, 1, 3, true);
+	CHECK(averaged[1] == 0x02FF8081);
+
+	VideoFrameQueue queue(4);
+	queue.setDeinterlaceMode(Deinterlace::Mode::Bob);
+	std::fill_n(queue.push(1000, 1, 4, 0), 4, 0);
+	queue.setInterlaced(false, 20);
+	std::copy(woven, woven + 4, queue.push(1040, 1, 4, 0));
+	VideoFrameQueue::Show show;
+	CHECK(!queue.nextToShow(999, show));
+	CHECK(queue.nextToShow(1000, show) && show == VideoFrameQueue::Show::FirstField);
+	queue.presented(show);
+	CHECK(!queue.nextToShow(1019, show));
+	CHECK(queue.nextToShow(1020, show) && show == VideoFrameQueue::Show::SecondField);
+	queue.presented(show);
+	// The next frame is progressive
+	CHECK(queue.nextToShow(1040, show) && show == VideoFrameQueue::Show::Frame);
+	queue.render(show, out);
+	CHECK(out[3] == 0x30303030);
+	queue.presented(show);
+	CHECK(queue.empty());
+
+	// Bottom field first: the bottom field's lines come first
+	std::copy(woven, woven + 4, queue.push(2000, 1, 4, 0));
+	queue.setInterlaced(false, 20);
+	CHECK(queue.nextToShow(2000, show) && show == VideoFrameQueue::Show::FirstField);
+	queue.render(show, out);
+	CHECK(out[0] == 0x10101010 && out[3] == 0x30303030);
+	// Late: straight to the second field
+	queue.presented(show);
+	std::copy(woven, woven + 4, queue.push(3000, 1, 4, 0));
+	queue.setInterlaced(true, 20);
+	CHECK(queue.nextToShow(3025, show) && show == VideoFrameQueue::Show::SecondField);
+	queue.render(show, out);
+	CHECK(out[1] == 0x10101010 && out[0] == 0x10101010);
+	queue.presented(show);
+
+	// Deinterlacing off: shown whole
+	queue.setDeinterlaceMode(Deinterlace::Mode::Off);
+	std::copy(woven, woven + 4, queue.push(4000, 1, 4, 0));
+	queue.setInterlaced(true, 20);
+	CHECK(queue.nextToShow(4000, show) && show == VideoFrameQueue::Show::Frame);
+	queue.render(show, out);
+	CHECK(std::equal(woven, woven + 4, out));
+	queue.presented(show);
+	CHECK(queue.empty());
+}
+
+// Yadif keeps still detail from the other field, so a still horizontal edge stays put in both fields, and
+// interpolates where the fields differ, so combing from motion goes
+static void testYadifDeinterlace() {
+	constexpr uint32_t width = 8, height = 8;
+	const auto picture = [&](const auto &pixel) {
+		std::vector<uint32_t> p(width * height);
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++) {
+				p[y * width + x] = pixel(x, y);
+			}
+		}
+		return p;
+	};
+	std::vector<uint32_t> out(width * height);
+
+	// Still: a horizontal edge, and a diagonal one
+	const auto still = picture([](const uint32_t x, const uint32_t y) {
+		return (y >= 4 ? 0xC8C8C8u : 0x101010u) + (x + y > 8 ? 0x200000u : 0u);
+	});
+	for (const bool top: {true, false}) {
+		for (const bool first: {true, false}) {
+			Deinterlace::yadifField(still.data(), still.data(), still.data(), out.data(), width, height, top, first);
+			CHECK(out == still);
+		}
+	}
+
+	// Moving: the bottom field is far from the top field and from the fields before and after
+	const auto combed = picture([](uint32_t, const uint32_t y) { return y & 1 ? 0xC8C8C8u : 0x101010u; });
+	const auto flat = picture([](uint32_t, uint32_t) { return 0x101010u; });
+	Deinterlace::yadifField(flat.data(), combed.data(), flat.data(), out.data(), width, height, true, true);
+	CHECK(out == flat);
+
+	// Through the queue: the frame before is kept for the first field of the next
+	VideoFrameQueue queue(4);
+	std::copy(still.begin(), still.end(), queue.push(0, width, height, 0));
+	queue.setInterlaced(true, 20);
+	VideoFrameQueue::Show show;
+	CHECK(queue.nextToShow(0, show));
+	queue.render(show, out.data());
+	CHECK(out == still);
+	queue.presented(show);
+	CHECK(queue.nextToShow(20, show) && show == VideoFrameQueue::Show::SecondField);
+	queue.render(show, out.data());
+	CHECK(out == still);
+	queue.presented(show);
+	std::copy(still.begin(), still.end(), queue.push(40, width, height, 0));
+	queue.setInterlaced(true, 20);
+	CHECK(queue.nextToShow(40, show));
+	queue.render(show, out.data());
+	CHECK(out == still);
+}
+
 // Alternate scan, intra VLC table B-15, non-linear quantiser scale, 11-bit intra DC, custom matrices
 static void testMpeg2CodingOptions() {
 	checkVideoMatchesFfmpeg(generate("m2options.vob", VIDEO_MOVING + " -t 2 -c:v mpeg2video -alternate_scan 1"
@@ -1308,6 +1454,9 @@ int main(int argc, char *argv[]) {
 		{"mpeg-1 matches ffmpeg", testMpeg1MatchesFfmpeg},
 		{"mpeg-2 progressive", testMpeg2Progressive},
 		{"mpeg-2 interlaced", testMpeg2Interlaced},
+		{"interlace flags", testInterlaceFlags},
+		{"bob deinterlace", testBobDeinterlace},
+		{"yadif deinterlace", testYadifDeinterlace},
 		{"mpeg-2 coding options", testMpeg2CodingOptions},
 		{"mpeg-2 in mixed system layers", testMpeg2MixedLayers},
 		{"mpeg-2 dual prime", testMpeg2DualPrime},

@@ -118,6 +118,14 @@ int main(int argc, char *argv[]) {
 		if (input.seekFraction >= 0) {
 			seekRequestFraction = input.seekFraction;
 		}
+		if (input.toggleDeinterlace) {
+			// Yadif, off, bob, yadif...
+			const auto mode = frameQueue.deinterlaceMode();
+			frameQueue.setDeinterlaceMode(mode == Deinterlace::Mode::Yadif ? Deinterlace::Mode::Off
+			                              : mode == Deinterlace::Mode::Off ? Deinterlace::Mode::Bob
+			                              : Deinterlace::Mode::Yadif);
+			std::cout << "Deinterlacing: " << Deinterlace::name(frameQueue.deinterlaceMode()) << std::endl;
+		}
 		if (input.togglePause) {
 			const bool paused = !clock.paused();
 			clock.setPaused(paused);
@@ -136,7 +144,8 @@ int main(int argc, char *argv[]) {
 			return;
 		}
 		clock.startAt(frameQueue.front().ptsMs);
-		if (!frameQueue.frontIsDue(clock.ms())) {
+		VideoFrameQueue::Show show;
+		if (!frameQueue.nextToShow(clock.ms(), show)) {
 			return;
 		}
 		const auto &frame = frameQueue.front();
@@ -148,13 +157,13 @@ int main(int argc, char *argv[]) {
 			screenAspect = displayAspect;
 			sdl.reinitScreen(frame.width, frame.height, 1, false, displayAspect);
 		}
-		std::memcpy(sdl.rgbData(), frame.rgb.get(), static_cast<size_t>(frame.width) * frame.height * sizeof(uint32_t));
+		frameQueue.render(show, sdl.rgbData());
 		sdl.blitSurface();
 		if (frame.timelineMs >= 0) {
 			timelineOffsetMs = frame.timelineMs - frame.ptsMs;
 			timelineOffsetKnown = true;
 		}
-		frameQueue.pop();
+		frameQueue.presented(show);
 	};
 
 	// Continues playback from a byte position in the file
@@ -221,6 +230,9 @@ int main(int argc, char *argv[]) {
 			const int64_t timelineMs = frame.m_ptsMillis >= 0 ? mps.timelineMillis(frame.m_ptsMillis) : -1;
 			videoDecoder.generateRgbFrameData(
 				frameQueue.push(ptsMs, frame.m_width, frame.m_height, frame.m_aspectRatio, timelineMs), frame);
+			if (frame.m_interlaced) {
+				frameQueue.setInterlaced(frame.m_topFieldFirst, std::lround(videoDecoder.m_frame_period_millis / 2));
+			}
 		});
 
 	audioDecoder.setFrameCallback(
