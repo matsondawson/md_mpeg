@@ -199,6 +199,7 @@ void ScreenContextRgbSDL::startAudio(const int32_t firstPtsMs) {
 	}
 	m_audioStartPtsMs = firstPtsMs;
 	m_audioPlaying = true;
+	m_stallDetector.started(now());
 	if (!m_audioPaused) {
 		SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(m_soundStream));
 	}
@@ -211,7 +212,9 @@ void ScreenContextRgbSDL::setAudioPaused(const bool paused) {
 	}
 	if (paused) {
 		SDL_PauseAudioDevice(SDL_GetAudioStreamDevice(m_soundStream));
-	} else {
+	} else if (!m_stallDetector.stalled()) {
+		// No callbacks came while paused
+		m_stallDetector.started(now());
 		SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(m_soundStream));
 	}
 }
@@ -234,6 +237,7 @@ void ScreenContextRgbSDL::resetAudio() {
 		m_lastCallbackTimeMs = 0;
 	}
 	m_audioPlaying = false;
+	m_stallDetector.reset();
 	SDL_UnlockAudioStream(m_soundStream);
 }
 
@@ -249,6 +253,26 @@ std::optional<int64_t> ScreenContextRgbSDL::audioClockMs() {
 		framesBefore = m_framesBeforeLastCallback;
 		framesAfter = m_framesAfterLastCallback;
 		callbackTimeMs = m_lastCallbackTimeMs;
+	}
+
+	if (!m_audioPaused) {
+		const bool wasStalled = m_stallDetector.stalled();
+		if (m_stallDetector.update(now(), callbackTimeMs)) {
+			if (!wasStalled) {
+				cout << "Audio output stopped taking samples, continuing without sound until the next seek" << endl;
+				// Keep it quiet if it comes back, so it doesn't play out of step
+				SDL_PauseAudioDevice(SDL_GetAudioStreamDevice(m_soundStream));
+			}
+			// Make room so the audio decoder doesn't hold up the demuxer
+			SDL_LockAudioStream(m_soundStream);
+			while (!m_soundBuffer->isEmpty()) {
+				m_soundBuffer->nextByte();
+			}
+			SDL_UnlockAudioStream(m_soundStream);
+			return std::nullopt;
+		}
+	} else if (m_stallDetector.stalled()) {
+		return std::nullopt;
 	}
 
 	// Ran dry: nothing decoded and nothing left queued in SDL

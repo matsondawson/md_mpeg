@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "AudioStallDetector.h"
 #include "DisplayTimestamper.h"
 #include "stream/FileStream.h"
 #include "mpeg1/MpegProgramStream.h"
@@ -453,6 +454,34 @@ static void testConcatenated() {
 	CHECK(p->finished);
 	CHECK(p->frames == 200);
 	checkSteps(p->displayPts, 0, 39, 41);
+}
+
+// An audio output that stops calling back counts as stalled once STALL_MS passes, and stays so until reset.
+// Pauses and the wait for the first callback don't count.
+static void testAudioStall() {
+	constexpr int64_t stall = AudioStallDetector::STALL_MS;
+	AudioStallDetector detector;
+	detector.started(1000);
+	// Waiting for the first callback
+	CHECK(!detector.update(1000 + stall, 0));
+	CHECK(detector.update(1001 + stall, 0));
+	CHECK(detector.stalled());
+	// Sticky, even if callbacks come back
+	CHECK(detector.update(2000 + stall, 2000 + stall));
+
+	detector.reset();
+	CHECK(!detector.stalled());
+	detector.started(5000);
+	// Regular callbacks
+	for (int64_t t = 5000; t < 10000; t += 20) {
+		CHECK(!detector.update(t + 15, t));
+	}
+	// Resumed after a long pause: nothing expected from before
+	detector.started(20000);
+	CHECK(!detector.update(20000 + stall, 9980));
+	// Callbacks stop
+	CHECK(!detector.update(20100 + stall, 20100));
+	CHECK(detector.update(20101 + stall, 20100));
 }
 
 static void testSeek() {
@@ -1171,6 +1200,7 @@ int main(int argc, char *argv[]) {
 		{"corrupt", testCorrupt},
 		{"concatenated", testConcatenated},
 		{"seek", testSeek},
+		{"audio output stall", testAudioStall},
 #if MD_MPEG_ENABLE_MPEG2
 		{"mpeg-1 matches ffmpeg", testMpeg1MatchesFfmpeg},
 		{"mpeg-2 progressive", testMpeg2Progressive},
