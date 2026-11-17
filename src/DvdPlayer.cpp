@@ -135,7 +135,7 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path) {
 			return;
 		}
 		const auto &frame = frameQueue.front();
-		const double pelAspect = video->aspect_ratio;
+		const double pelAspect = frame.pelAspect;
 		const double displayAspect = pelAspect > 0 ? frame.width / (frame.height * pelAspect) : 0;
 		if (frame.width != screenWidth || frame.height != screenHeight || displayAspect != screenAspect) {
 			screenWidth = frame.width;
@@ -166,7 +166,7 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path) {
 				return;
 			}
 		}
-		video->generateRgbFrameData(frameQueue.push(ptsMs, video->m_width, video->m_height), frame);
+		video->generateRgbFrameData(frameQueue.push(ptsMs, frame.m_width, frame.m_height, frame.m_aspectRatio), frame);
 	});
 
 	audio.setFrameCallback([&](const uint32_t frequency, const uint32_t channels, AudioSampleBuffer *soundBuffer) {

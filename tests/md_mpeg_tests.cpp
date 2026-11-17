@@ -128,8 +128,8 @@ struct Pipeline {
 				timelinePts.push_back(demux.timelineMillis(frame.m_ptsMillis));
 			}
 			streamPts.push_back(frame.m_ptsMillis);
-			width = video.m_width;
-			height = video.m_height;
+			width = frame.m_width;
+			height = frame.m_height;
 			if (firstFrameRgb.empty()) {
 				firstFrameRgb.resize(static_cast<size_t>(width) * height);
 				video.generateRgbFrameData(firstFrameRgb.data(), frame);
@@ -487,6 +487,61 @@ static void testSeek() {
 	}
 }
 
+// A sequence header that changes the picture size, with no sequence end code before it, after a picture is missing
+// (as when a stream is cut). The last anchor picture of the first sequence is then still held back for display order
+// when that header is read, and is output after it, so it must keep its own size.
+static void testSizeChange() {
+	std::vector<uint8_t> stream;
+	// 52 pictures end with P B B in coded order. Without the last B, the P is held back until the next group.
+	for (const std::string size: {"320x240", "480x360"}) {
+		const auto path = media("size" + size + ".m1v");
+		if (!fs::exists(path)) {
+			run("ffmpeg -nostdin -y -f lavfi -i testsrc=size=" + size + ":rate=25 -frames:v 52 -c:v mpeg1video -bf 2"
+			    " -g 12 -f mpeg1video \"" + path.string() + "\"");
+		}
+		auto clip = readFile(path);
+		const std::vector<uint8_t> sequenceEnd = {0, 0, 1, 0xB7};
+		if (clip.size() >= 4 && std::equal(sequenceEnd.begin(), sequenceEnd.end(), clip.end() - 4)) {
+			clip.resize(clip.size() - 4);
+		}
+		if (stream.empty()) {
+			const std::vector<uint8_t> pictureStart = {0, 0, 1, 0};
+			const auto last = std::find_end(clip.begin(), clip.end(), pictureStart.begin(), pictureStart.end());
+			CHECK(last != clip.end());
+			clip.erase(last, clip.end());
+		}
+		stream.insert(stream.end(), clip.begin(), clip.end());
+	}
+
+	const auto video = std::make_unique<Mpeg1VideoDecoder>();
+	std::vector<std::pair<uint32_t, uint32_t>> sizes;
+	bool decoderAhead = false;
+	std::vector<uint32_t> rgb;
+	video->setFrameCallback([&](const Frame &frame) {
+		sizes.emplace_back(frame.m_width, frame.m_height);
+		CHECK(frame.m_width <= frame.m_frameSize.luma_width && frame.m_height <= frame.m_frameSize.luma_height);
+		decoderAhead |= frame.m_width != video->m_width;
+		rgb.assign(static_cast<size_t>(frame.m_width) * frame.m_height, 0);
+		video->generateRgbFrameData(rgb.data(), frame);
+	});
+	for (const auto byte: stream) {
+		video->writeByte(byte);
+	}
+	video->flush();
+	// The case this tests: a picture output after the decoder moved on to the next size
+	CHECK(decoderAhead);
+	CHECK(sizes.size() == 103);
+	for (size_t i = 0; i < sizes.size(); i++) {
+		const auto expected = i < 51 ? std::pair<uint32_t, uint32_t>{320, 240} : std::pair<uint32_t, uint32_t>{480, 360};
+		if (sizes[i] != expected) {
+			g_failures++;
+			std::cout << "  FAIL " << g_currentTest << ": picture " << i << " is " << sizes[i].first << "x"
+				<< sizes[i].second << std::endl;
+			break;
+		}
+	}
+}
+
 #if MD_MPEG_ENABLE_MPEG2
 // ---------------------------------------------------------------- MPEG-2
 
@@ -498,7 +553,7 @@ static std::vector<std::vector<uint8_t>> decodeYuv(const fs::path &path, bool &m
 	demux.setVideoDecoder(video.get());
 	std::vector<std::vector<uint8_t>> frames;
 	video->setFrameCallback([&](const Frame &frame) {
-		const uint32_t w = video->m_width, h = video->m_height;
+		const uint32_t w = frame.m_width, h = frame.m_height;
 		std::vector<uint8_t> yuv;
 		yuv.reserve(w * h * 3 / 2);
 		const auto copy = [&](const uint8_t *plane, const uint32_t stride, const uint32_t pw, const uint32_t ph) {
@@ -1111,6 +1166,7 @@ int main(int argc, char *argv[]) {
 		{"extension and user data", testExtensionAndUserData},
 		{"audio accuracy", testAudioAccuracy},
 		{"unsupported audio", testUnsupportedAudio},
+		{"size change", testSizeChange},
 		{"truncated", testTruncated},
 		{"corrupt", testCorrupt},
 		{"concatenated", testConcatenated},

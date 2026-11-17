@@ -126,8 +126,7 @@ int main(int argc, char *argv[]) {
 			return;
 		}
 		const auto &frame = frameQueue.front();
-		// The decoder's pel aspect ratio is pixel height / width, 0 if unknown
-		const double pelAspect = videoDecoder.aspect_ratio;
+		const double pelAspect = frame.pelAspect;
 		const double displayAspect = pelAspect > 0 ? frame.width / (frame.height * pelAspect) : 0;
 		if (frame.width != screenWidth || frame.height != screenHeight || displayAspect != screenAspect) {
 			screenWidth = frame.width;
@@ -206,8 +205,8 @@ int main(int argc, char *argv[]) {
 			}
 
 			const int64_t timelineMs = frame.m_ptsMillis >= 0 ? mps.timelineMillis(frame.m_ptsMillis) : -1;
-			videoDecoder.generateRgbFrameData(frameQueue.push(ptsMs, videoDecoder.m_width, videoDecoder.m_height, timelineMs),
-			                                  frame);
+			videoDecoder.generateRgbFrameData(
+				frameQueue.push(ptsMs, frame.m_width, frame.m_height, frame.m_aspectRatio, timelineMs), frame);
 		});
 
 	audioDecoder.setFrameCallback(

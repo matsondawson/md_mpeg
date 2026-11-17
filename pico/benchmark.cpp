@@ -204,7 +204,7 @@ namespace {
 			result.frames++;
 			g_frames = result.frames;
 			if (hash) {
-				rgb.resize(videoDecoder->m_width * videoDecoder->m_height);
+				rgb.resize(frame.m_width * frame.m_height);
 				videoDecoder->generateRgbFrameData(rgb.data(), frame);
 				result.videoHash = fnv(result.videoHash, rgb.data(), rgb.size() * sizeof(uint32_t));
 				return;
