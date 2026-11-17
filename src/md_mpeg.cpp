@@ -15,7 +15,7 @@
 #include "stream/RingBufferWithStartCodeEvent.h"
 #include "mpeg1/MpegProgramStream.h"
 #include "mpeg1/Mpeg1VideoDecoder.h"
-#include "mpeg1/Mpeg1AudioDecoder.h"
+#include "mpeg1/AudioDecoders.h"
 #include "sdl2/screenContext.h"
 
 int main(int argc, char *argv[]) {
@@ -38,10 +38,9 @@ int main(int argc, char *argv[]) {
 	Mpeg1::MpegProgramStream mps;
 	Mpeg1VideoDecoder videoDecoder;
 	mps.setVideoDecoder(&videoDecoder);
-	Mpeg1AudioDecoder audioDecoder;
-	mps.setAudioDecoder(&audioDecoder);
-	const auto [endPackPosition, endScrMillis] = Mpeg1::findLastPack(fs);
-	mps.setEndPack(endPackPosition, endScrMillis);
+	AudioDecoders audioDecoder;
+	audioDecoder.attach(mps);
+	mps.buildTimeline(fs);
 
 	// Audio is the master clock when there is audio, otherwise wall time
 	PlaybackClock clock;
@@ -57,8 +56,13 @@ int main(int argc, char *argv[]) {
 	double seekRequestFraction = -1;
 	auto actionPending = [&] { return quitRequested || seekRequestSeconds != 0 || seekRequestFraction >= 0; };
 
-	// Position shown on the control bar; held at the seek target until playback resumes after a seek
+	// Position shown on the control bar, on the file's timeline; held at the seek target until playback resumes
+	// after a seek
 	int64_t positionMs = 0;
+	// Timeline time minus clock time. The clock follows the stream's PTS, made continuous where they jump, so
+	// this changes where a new program starts in the file.
+	int64_t timelineOffsetMs = 0;
+	bool timelineOffsetKnown = false;
 
 	// Starts audio once ~100ms is buffered, so the device doesn't immediately run dry
 	auto maybeStartAudio = [&](const bool force) {
@@ -69,6 +73,12 @@ int main(int argc, char *argv[]) {
 		const uint32_t prebuffer = std::min(sdl.m_wav_spec.freq * sdl.m_wav_spec.channels / 10, static_cast<int>(soundBuffer->size() / 2));
 		if (soundBuffer->used() >= prebuffer || (force && !soundBuffer->isEmpty())) {
 			sdl.startAudio(audioDecoder.firstFramePtsMillis());
+			// Audio only: there are no frames to give the position
+			const int64_t timelineMs = mps.timelineMillis(audioDecoder.firstFramePtsMillis());
+			if (!timelineOffsetKnown && timelineMs >= 0) {
+				timelineOffsetMs = timelineMs - audioDecoder.firstFramePtsMillis();
+				timelineOffsetKnown = true;
+			}
 		}
 	};
 
@@ -85,10 +95,10 @@ int main(int argc, char *argv[]) {
 			sdl.setAudioPaused(paused);
 		}
 
-		if (clock.started() && mps.startMillis() >= 0) {
-			positionMs = clock.ms() - mps.startMillis();
+		if (clock.started() && timelineOffsetKnown) {
+			positionMs = clock.ms() + timelineOffsetMs;
 		}
-		sdl.updateControlBar({clock.paused(), positionMs, mps.durationMillis()});
+		sdl.updateControlBar({clock.paused(), positionMs, mps.timelineDurationMillis()});
 	};
 
 	// Shows the frame that is due now, if any
@@ -112,6 +122,10 @@ int main(int argc, char *argv[]) {
 		}
 		std::memcpy(sdl.rgbData(), frame.rgb.get(), static_cast<size_t>(frame.width) * frame.height * sizeof(uint32_t));
 		sdl.blitSurface();
+		if (frame.timelineMs >= 0) {
+			timelineOffsetMs = frame.timelineMs - frame.ptsMs;
+			timelineOffsetKnown = true;
+		}
 		frameQueue.pop();
 	};
 
@@ -127,27 +141,29 @@ int main(int argc, char *argv[]) {
 		frameQueue.clear();
 		displayTimestamper.reset();
 		clock.reset();
+		timelineOffsetKnown = false;
 	};
 
 	// Jumps by deltaSeconds from the current position
 	auto seekBy = [&](const int32_t deltaSeconds) {
-		const int64_t currentMs = clock.started() ? clock.ms() : 0;
-		const int64_t targetMs = std::max<int64_t>(0, currentMs + static_cast<int64_t>(deltaSeconds) * 1000);
-		const int64_t position = mps.estimateBytePosition(targetMs);
+		int64_t targetMs = std::max<int64_t>(0, positionMs + static_cast<int64_t>(deltaSeconds) * 1000);
+		if (mps.timelineDurationMillis() > 0) {
+			targetMs = std::min(targetMs, mps.timelineDurationMillis());
+		}
+		const int64_t position = mps.findTimelinePosition(fs, targetMs);
 		if (position < 0) {
-			return; // Nothing demuxed yet to estimate from
+			return; // Nothing known yet to estimate from
 		}
 		seekToPosition(position);
-		if (mps.startMillis() >= 0) {
-			positionMs = targetMs - mps.startMillis();
-		}
+		positionMs = targetMs;
 	};
 
 	// Jumps to a fraction of the way through the file (the seek bar)
 	auto seekToFraction = [&](const double fraction) {
-		seekToPosition(static_cast<int64_t>(fraction * static_cast<double>(fs.size())));
-		if (mps.durationMillis() > 0) {
-			positionMs = static_cast<int64_t>(fraction * static_cast<double>(mps.durationMillis()));
+		const auto position = static_cast<int64_t>(fraction * static_cast<double>(fs.size()));
+		seekToPosition(position);
+		if (const int64_t timelineMs = mps.timelineAtPosition(position); timelineMs >= 0) {
+			positionMs = timelineMs;
 		}
 	};
 
@@ -174,7 +190,9 @@ int main(int argc, char *argv[]) {
 				}
 			}
 
-			videoDecoder.generateRgbFrameData(frameQueue.push(ptsMs, videoDecoder.m_width, videoDecoder.m_height), frame);
+			const int64_t timelineMs = frame.m_ptsMillis >= 0 ? mps.timelineMillis(frame.m_ptsMillis) : -1;
+			videoDecoder.generateRgbFrameData(frameQueue.push(ptsMs, videoDecoder.m_width, videoDecoder.m_height, timelineMs),
+			                                  frame);
 		});
 
 	audioDecoder.setFrameCallback(
@@ -214,9 +232,25 @@ int main(int argc, char *argv[]) {
 			continue;
 		}
 
+		// Sleep at the end of this iteration only if there was nothing to demux
+		bool idle = true;
 		try {
 			if (!endOfStream) {
-				endOfStream = mps.nextPacket(fs) == Mpeg1::DemuxResult::EndOfStream;
+				// Demux in bursts. A call can handle as little as a pack header, so one call per 1 ms sleep caps the
+				// input below DVD bit rates. A burst ends when input or space in the sound buffer runs out, or after
+				// a few ms, so frames are presented and input handled on time.
+				const auto burstEnd = std::chrono::steady_clock::now() + std::chrono::milliseconds(4);
+				do {
+					const auto result = mps.nextPacket(fs);
+					if (result == Mpeg1::DemuxResult::EndOfStream) {
+						endOfStream = true;
+						break;
+					}
+					if (result == Mpeg1::DemuxResult::WaitingForInput || audioDecoder.hasPendingFrame()) {
+						break;
+					}
+					idle = false;
+				} while (!actionPending() && std::chrono::steady_clock::now() < burstEnd);
 			} else if (!streamFailed) {
 				// Decode audio frames that were waiting for space in the sound buffer
 				audioDecoder.executeCallbacks();
@@ -231,7 +265,9 @@ int main(int argc, char *argv[]) {
 		if (endOfStream && !clock.paused() && frameQueue.empty() && !audioStillPlaying()) {
 			break;
 		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		if (idle) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
 	}
 	if (!quitRequested && sdl.audioPlaying()) {
 		// Let the audio device play its last buffer

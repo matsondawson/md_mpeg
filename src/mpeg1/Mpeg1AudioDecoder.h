@@ -55,8 +55,14 @@ private:
 	uint32_t m_resyncSkippedBytes = 0;
 	// After a reset the first packet usually starts mid-frame, so the first skip isn't corruption
 	bool m_expectResync = false;
-	// Headers of other MPEG audio formats seen before any valid frame; enough of them disables audio
-	uint32_t m_unsupportedHeaderCount = 0;
+	// Frames of another MPEG audio format (e.g. MP3) seen back to back before any valid frame; enough of them
+	// disables audio. Only consecutive frames count, as data that starts mid-frame can look like headers.
+	uint32_t m_unsupportedFrameRun = 0;
+	// Bytes skipped looking for headers, the position where the last unsupported frame ends, and its header's
+	// format fields
+	uint32_t m_searchPosition = 0;
+	uint32_t m_unsupportedFrameEnd = 0;
+	uint32_t m_unsupportedFormat = 0;
 	bool m_audioDisabled = false;
 
 	uint8_t m_audioVersion = 0;
@@ -125,10 +131,14 @@ public:
 	[[nodiscard]] bool isFull() override;
 	void executeCallbacks() override;
 	void flush() override;
+	// Drops a partly received frame, keeping the timing and output format
+	void discontinuity() override;
 
 	void decode();
 	void decodeHeader();
 	bool isValidHeader(uint32_t header);
+	// Counts a frame header of an unsupported MPEG audio format at the current search position
+	void noteUnsupportedHeader(uint32_t header);
 	void resync();
 	// Discards all buffered input and decoding state, e.g. after seeking. The sound buffer is
 	// cleared by its consumer.

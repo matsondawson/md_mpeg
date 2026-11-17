@@ -12,8 +12,9 @@
 #include "../stream/MStream.h"
 #include "../stream/FileStream.h"
 #include "../stream/RingBufferWithStartCodeEvent.h"
+#include "ProgramTimeline.h"
 
-// Set to 0 to build without MPEG-2 video (and MPEG-2 program streams), for a smaller binary
+// Set to 0 to build without MPEG-2 video, MPEG-2 program streams and A/52 audio, for a smaller binary
 #ifndef MD_MPEG_ENABLE_MPEG2
 #define MD_MPEG_ENABLE_MPEG2 1
 #endif
@@ -29,6 +30,8 @@ namespace Mpeg1 {
 	constexpr uint32_t PACK_START_CODE = 0x000001BA;
 	constexpr uint32_t SYSTEM_START_CODE = 0x000001BB;
 	constexpr uint32_t PADDING_STREAM_START_CODE = 0x000001BE;
+	// Carries A/52 audio, among other things, in sub-streams
+	constexpr uint32_t PRIVATE_STREAM_1_START_CODE = 0x000001BD;
 	constexpr uint32_t VIDEO_STREAM_1_START_CODE = 0x000001E0;
 	constexpr uint32_t AUDIO_STREAM_1_START_CODE = 0x000001C0;
 	// Lowest stream id; every start code from here up is a packet with a 16-bit length
@@ -107,14 +110,28 @@ namespace Mpeg1 {
 		uint32_t m_syncSkippedBytes = 0;
 		// After a seek the input starts mid-packet, so skipping to the first start code isn't corruption
 		bool m_expectSyncSkip = false;
-		// Only the first video and audio streams are decoded, 0 until seen
+		// The video and audio streams decoded, 0 until seen. Only the first video stream is decoded, see
+		// selectAudioStream for audio. An A/52 audio stream's code is (PRIVATE_STREAM_1_START_CODE << 8) + its
+		// sub-stream id.
 		uint32_t m_videoStreamCode = 0;
 		uint32_t m_audioStreamCode = 0;
+		// Packs since the last packet of the selected audio stream, and the lowest numbered other stream of its
+		// kind seen since
+		uint32_t m_packsSinceSelectedAudio = 0;
+		uint32_t m_lowestOtherAudioStreamCode = 0;
+
+		// Time across the whole file, see buildTimeline. Timeline time minus SCR, for the latest pack.
+		ProgramTimeline m_timeline;
+		int64_t m_timelineOffsetMillis = 0;
+		bool m_timelineOffsetKnown = false;
 
 		NullDecoderStream m_nullDecoderStream;
 		MStream::IWriteByteStream *m_ptrCurrentDecoderStream;
 		MStream::IWriteByteStream *m_ptrVideoDecoderStream;
 		MStream::IWriteByteStream *m_ptrAudioDecoderStream;
+		MStream::IWriteByteStream *m_ptrA52DecoderStream;
+		// The decoder of the audio stream being decoded
+		MStream::IWriteByteStream *m_ptrSelectedAudioDecoderStream;
 
 	public:
 		MpegProgramStream()
@@ -123,7 +140,9 @@ namespace Mpeg1 {
 			  , m_streamingPacketBytesRemaining(0)
 			  , m_ptrCurrentDecoderStream(nullptr)
 			  , m_ptrVideoDecoderStream(&m_nullDecoderStream)
-			  , m_ptrAudioDecoderStream(&m_nullDecoderStream) {
+			  , m_ptrAudioDecoderStream(&m_nullDecoderStream)
+			  , m_ptrA52DecoderStream(&m_nullDecoderStream)
+			  , m_ptrSelectedAudioDecoderStream(&m_nullDecoderStream) {
 			// empty
 		}
 
@@ -168,7 +187,7 @@ namespace Mpeg1 {
 		 */
 		DemuxResult nextPacket(MStream::IReadByteStream &inputStream) {
 			// Let a decoder that was waiting on output space (audio backpressure) make progress
-			m_ptrAudioDecoderStream->executeCallbacks();
+			m_ptrSelectedAudioDecoderStream->executeCallbacks();
 
 			// fill buffer
 			bool streamFilled = false;
@@ -214,6 +233,7 @@ namespace Mpeg1 {
 						case PACK_START_CODE: {
 							// Unread bytes include the 4 just pulled
 							m_lastPackPosition = m_inputPosition - m_buffer.used() - 4;
+							m_packsSinceSelectedAudio++;
 							decodePackHeader();
 							break;
 						}
@@ -225,11 +245,15 @@ namespace Mpeg1 {
 							if (isVideoStream(startCode) && (!m_videoStreamCode || m_videoStreamCode == startCode)) {
 								m_videoStreamCode = startCode;
 								m_ptrCurrentDecoderStream = m_ptrVideoDecoderStream;
-								decodeStreamHeader(startCode, false);
-							} else if (isAudioStream(startCode) && (!m_audioStreamCode || m_audioStreamCode == startCode)) {
-								m_audioStreamCode = startCode;
-								m_ptrCurrentDecoderStream = m_ptrAudioDecoderStream;
-								decodeStreamHeader(startCode, true);
+								setPacketPts(decodeStreamHeader(false));
+							} else if (isAudioStream(startCode) && selectAudioStream(startCode)) {
+								m_ptrCurrentDecoderStream = m_ptrSelectedAudioDecoderStream = m_ptrAudioDecoderStream;
+								setPacketPts(decodeStreamHeader(true));
+#if MD_MPEG_ENABLE_MPEG2
+							} else if (startCode == PRIVATE_STREAM_1_START_CODE
+							           && m_ptrA52DecoderStream != &m_nullDecoderStream) {
+								decodePrivateStream1Header();
+#endif
 							} else {
 								// Padding, private, additional or unsupported streams: skip the packet
 								m_streamingPacketBytesRemaining = m_buffer.pull(2);
@@ -304,7 +328,7 @@ namespace Mpeg1 {
 					packetWriteBytes--;
 					streamed++;
 				}
-				if (m_ptrCurrentDecoderStream == m_ptrAudioDecoderStream) m_ptrCurrentDecoderStream->executeCallbacks();
+				if (m_ptrCurrentDecoderStream == m_ptrSelectedAudioDecoderStream) m_ptrCurrentDecoderStream->executeCallbacks();
 
 				//assert(streamed <= packetWriteBytes);
 				//assert(streamed <= m_streamingPacketBytesRemaining);
@@ -404,12 +428,75 @@ namespace Mpeg1 {
 			return std::max<int64_t>(0, position);
 		}
 
+		/**
+		 * Samples the file to map byte positions to a timeline across the whole file, which stays right when the
+		 * SCR starts again part way through (see ProgramTimeline). Leaves the file positioned at the start.
+		 */
+		void buildTimeline(MStream::FileStreamRead &file) {
+			m_timeline.build(file);
+			if (m_timeline.valid()) {
+				setEndPack(m_timeline.points().back().position, m_timeline.points().back().scrMillis);
+			}
+		}
+
+		[[nodiscard]] const ProgramTimeline &timeline() const {
+			return m_timeline;
+		}
+
+		/**
+		 * Converts a PTS of the stream being demuxed to timeline time, which starts at 0 at the start of the file.
+		 * Uses the latest pack's program, so it applies to PTS of data demuxed recently.
+		 * @return ms, or -1 if not known yet
+		 */
+		[[nodiscard]] int64_t timelineMillis(const int64_t ptsMillis) const {
+			if (m_timelineOffsetKnown) {
+				return ptsMillis + m_timelineOffsetMillis;
+			}
+			return m_firstScrMillis >= 0 ? ptsMillis - m_firstScrMillis : -1;
+		}
+
+		// Length of the timeline, -1 if not known
+		[[nodiscard]] int64_t timelineDurationMillis() const {
+			return m_timeline.valid() ? m_timeline.durationMillis() : durationMillis();
+		}
+
+		// Timeline time at a byte position, -1 if not known
+		[[nodiscard]] int64_t timelineAtPosition(const int64_t position) const {
+			if (m_timeline.valid()) {
+				return m_timeline.timelineAtPosition(position);
+			}
+			const int64_t duration = durationMillis();
+			return duration > 0 && m_endPackPosition > 0 ? position * duration / m_endPackPosition : -1;
+		}
+
+		/**
+		 * Finds the file position holding data for timeline time targetMillis, reading packs from the file to
+		 * correct the estimate. Leaves the file at an undefined position.
+		 * @return byte position, or -1 if nothing is known yet
+		 */
+		int64_t findTimelinePosition(MStream::FileStreamRead &file, const int64_t targetMillis) const {
+			// Video is muxed ahead of its presentation time
+			const int64_t videoLeadMillis = m_lastVideoPtsMillis >= 0 && m_lastScrMillis >= 0
+				                                ? std::clamp<int64_t>(m_lastVideoPtsMillis - m_lastScrMillis, 0, 3000)
+				                                : 0;
+			if (m_timeline.valid()) {
+				return m_timeline.findPosition(file, std::max<int64_t>(0, targetMillis - videoLeadMillis));
+			}
+			return m_firstScrMillis >= 0 ? estimateBytePosition(targetMillis + m_firstScrMillis) : -1;
+		}
+
 		void setVideoDecoder(MStream::IWriteByteStream *decoder) {
 			m_ptrVideoDecoderStream = decoder;
 		}
 
+		// Decoder for MPEG audio streams
 		void setAudioDecoder(MStream::IWriteByteStream *decoder) {
 			m_ptrAudioDecoderStream = decoder;
+		}
+
+		// Decoder for A/52 audio, in private stream 1. Without one, those streams are skipped.
+		void setA52AudioDecoder(MStream::IWriteByteStream *decoder) {
+			m_ptrA52DecoderStream = decoder;
 		}
 
 		uint32_t pullBits(const uint32_t readBitCount) {
@@ -486,8 +573,47 @@ namespace Mpeg1 {
 			setPackTiming(system_clock_reference_base_millis, program_mux_rate);
 		}
 
+		/**
+		 * Decides whether to decode a packet of audio stream code. The lowest numbered stream wins, as DVDs
+		 * number their main soundtrack first. A file can hold several programs one after another with different
+		 * audio streams (DVD .vob files often do), so when the selected stream stops, for about half a second of
+		 * packs, while another of its kind carries on, the lowest numbered of those takes over. Only streams of
+		 * the kind first selected (MPEG audio or A/52) are switched to, as each has its own decoder and output.
+		 * @return true if the packet is of the selected stream
+		 */
+		bool selectAudioStream(const uint32_t code) {
+			constexpr uint32_t MISSING_PACKS = 256;
+			const auto isA52 = [](const uint32_t streamCode) { return streamCode > 0xFFFF; };
+			if (!m_audioStreamCode || code == m_audioStreamCode) {
+				m_audioStreamCode = code;
+				m_packsSinceSelectedAudio = 0;
+				m_lowestOtherAudioStreamCode = 0;
+				return true;
+			}
+			if (isA52(code) != isA52(m_audioStreamCode)) {
+				return false;
+			}
+			if (!m_lowestOtherAudioStreamCode || code < m_lowestOtherAudioStreamCode) {
+				m_lowestOtherAudioStreamCode = code;
+			}
+			if (code < m_audioStreamCode
+			    || (m_packsSinceSelectedAudio >= MISSING_PACKS && code == m_lowestOtherAudioStreamCode)) {
+				m_audioStreamCode = code;
+				m_packsSinceSelectedAudio = 0;
+				m_lowestOtherAudioStreamCode = 0;
+				// What the decoder has buffered of the previous stream isn't continued by this one
+				(isA52(code) ? m_ptrA52DecoderStream : m_ptrAudioDecoderStream)->discontinuity();
+				return true;
+			}
+			return false;
+		}
+
 		void setPackTiming(const int32_t scrMillis, const uint32_t programMuxRate) {
 			m_lastScrMillis = scrMillis;
+			if (m_timeline.valid() && m_lastPackPosition >= 0) {
+				m_timelineOffsetMillis = m_timeline.timelineAt(m_lastPackPosition, scrMillis) - scrMillis;
+				m_timelineOffsetKnown = true;
+			}
 			if (m_firstPackPosition < 0) {
 				m_firstPackPosition = m_lastPackPosition;
 				m_firstScrMillis = m_lastScrMillis;
@@ -520,7 +646,7 @@ namespace Mpeg1 {
 
 		// After the packet length: '10' and flags, PTS_DTS_flags and more flags, PES_header_data_length, the fields
 		// those flags select, then stuffing up to the header length
-		void decodeMpeg2PesHeader(const bool audio) {
+		int32_t decodeMpeg2PesHeader(const bool audio) {
 			pull(1);
 			const uint32_t ptsDtsFlags = pull(1) >> 6;
 			const uint32_t headerLength = pull(1);
@@ -528,6 +654,7 @@ namespace Mpeg1 {
 				throw CorruptPacketException("PES header longer than the packet");
 			}
 			uint32_t read = 0;
+			int32_t pts = -1;
 			if (ptsDtsFlags & 2) {
 				if (headerLength < 5) {
 					throw CorruptPacketException("PES header too short for its PTS");
@@ -535,14 +662,39 @@ namespace Mpeg1 {
 				m_bitsLeft = m_bitCount = 0;
 				// '0010' or '0011', then the PTS
 				pullBits(4);
-				const int32_t pts = decodeTime();
+				pts = decodeTime();
 				read = 5;
-				m_ptrCurrentDecoderStream->setPts(pts);
 				if (!audio) m_lastVideoPtsMillis = pts;
 			}
 			skip(headerLength - read);
+			return pts;
+		}
+
+		// The PES header has been read: an A/52 packet starts with its sub-stream id (0x80 to 0x87), the number of
+		// frames that start in it and the position of the first, which aren't needed as the decoder finds frames
+		// itself. Other sub-streams (LPCM, DTS, subtitles) are skipped.
+		void decodePrivateStream1Header() {
+			m_ptrCurrentDecoderStream = &m_nullDecoderStream;
+			const int32_t pts = decodeStreamHeader(true);
+			if (m_streamingPacketBytesRemaining < 4) {
+				return;
+			}
+			const uint32_t subStream = peek();
+			if ((subStream & 0xF8) != 0x80 || !selectAudioStream(PRIVATE_STREAM_1_START_CODE << 8 | subStream)) {
+				return;
+			}
+			skip(4);
+			m_ptrCurrentDecoderStream = m_ptrSelectedAudioDecoderStream = m_ptrA52DecoderStream;
+			setPacketPts(pts);
 		}
 #endif
+
+		// Gives the current stream the packet's PTS, if it has one
+		void setPacketPts(const int32_t pts) {
+			if (pts >= 0) {
+				m_ptrCurrentDecoderStream->setPts(pts);
+			}
+		}
 
 		void decodeSystemHeader() {
 			m_streamingPacketBytesRemaining = m_buffer.pull(2);
@@ -576,13 +728,13 @@ namespace Mpeg1 {
 			}
 		}
 
-		void decodeStreamHeader(const uint32_t startCode, const bool audio) {
+		// Reads the packet length and PES header, returns the PTS in ms or -1 if there is none
+		int32_t decodeStreamHeader(const bool audio) {
 			m_streamingPacketBytesRemaining = m_buffer.pull(2);
 
 #if MD_MPEG_ENABLE_MPEG2
 			if (peek() >> 6 == 2) {
-				decodeMpeg2PesHeader(audio);
-				return;
+				return decodeMpeg2PesHeader(audio);
 			}
 #endif
 
@@ -602,23 +754,21 @@ namespace Mpeg1 {
 			// pts_dts_marker
 			switch (pullBits(2)) {
 				case 0x00: {
-					break;
+					return -1;
 				}
 				case 0x02: {
 					const int32_t pts = decodeTime();
-					m_ptrCurrentDecoderStream->setPts(pts);
 					if (!audio) m_lastVideoPtsMillis = pts;
-					break;
+					return pts;
 				}
 				case 0x03: {
 					const int32_t pts = decodeTime(); // 36 bits
 					if (pullBits(4) != 1) {
 						throw CorruptPacketException("Invalid pts marker bit");
 					}
-					m_ptrCurrentDecoderStream->setPts(pts);
 					if (!audio) m_lastVideoPtsMillis = pts;
 					decodeTime(); // DTS, not used
-					break;
+					return pts;
 				}
 				default: // 0x01
 					throw CorruptPacketException("Invalid PTS/DTS flags");
@@ -642,32 +792,12 @@ namespace Mpeg1 {
 		}
 		file.seek(0);
 
-		// Pack header: 00 00 01 BA, then '0010' SCR[32..30] marker, SCR[29..15] marker, SCR[14..0] marker
-		for (size_t i = tail.size() >= 9 ? tail.size() - 9 : 0; i-- > 0;) {
-			if (tail[i] != 0 || tail[i + 1] != 0 || tail[i + 2] != 1 || tail[i + 3] != 0xBA) {
-				continue;
+		for (size_t i = tail.size() >= 10 ? tail.size() - 10 : 0; i-- > 0;) {
+			int64_t scrMillis;
+			if (tail[i] == 0 && tail[i + 1] == 0 && tail[i + 2] == 1 && tail[i + 3] == 0xBA
+			    && packHeaderScr(&tail[i + 4], scrMillis)) {
+				return {static_cast<int64_t>(start + i), scrMillis};
 			}
-			const uint8_t *b = &tail[i + 4];
-#if MD_MPEG_ENABLE_MPEG2
-			// MPEG-2: '01' SCR[32..30] marker SCR[29..28] / [27..20] / [19..15] marker [14..13] / [12..5] / [4..0] marker
-			if ((b[0] >> 6) == 1 && (b[0] & 4) && (b[2] & 4) && (b[4] & 4) && (b[5] & 1)) {
-				const uint64_t scr = static_cast<uint64_t>((b[0] >> 3) & 7) << 30
-				                     | static_cast<uint64_t>(b[0] & 3) << 28
-				                     | static_cast<uint64_t>(b[1]) << 20
-				                     | static_cast<uint64_t>(b[2] >> 3) << 15
-				                     | static_cast<uint64_t>(b[2] & 3) << 13
-				                     | static_cast<uint64_t>(b[3]) << 5
-				                     | static_cast<uint64_t>(b[4] >> 3);
-				return {static_cast<int64_t>(start + i), static_cast<int64_t>(scr / 90)};
-			}
-#endif
-			if ((b[0] >> 4) != 2 || !(b[0] & 1) || !(b[2] & 1) || !(b[4] & 1)) {
-				continue;
-			}
-			const uint64_t scr = static_cast<uint64_t>((b[0] >> 1) & 7) << 30
-			                     | static_cast<uint64_t>(((b[1] << 8) | b[2]) >> 1) << 15
-			                     | static_cast<uint64_t>(((b[3] << 8) | b[4]) >> 1);
-			return {static_cast<int64_t>(start + i), static_cast<int64_t>(scr / 90)};
 		}
 		return {-1, -1};
 	}
