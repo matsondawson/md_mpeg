@@ -667,8 +667,8 @@ namespace {
 			waitForScan();
 
 			// Core 1 is idle, so the plan and the screen can change
-			if (videoDecoder->m_width != s_plan.sourceWidth || videoDecoder->m_height != s_plan.sourceHeight) {
-				buildPlan(videoDecoder->m_width, videoDecoder->m_height);
+			if (frame.m_width != s_plan.sourceWidth || frame.m_height != s_plan.sourceHeight) {
+				buildPlan(frame.m_width, frame.m_height);
 				printf("  %.2f fps, %lu bit/s, %lu KB picture buffer declared\n", videoDecoder->m_frame_rate,
 				       videoDecoder->bit_rate, videoDecoder->vbv_buffer_size);
 				s_display.fill(0x0000);

@@ -185,14 +185,15 @@ void Frame::init(const int32_t ptsMillis, const FrameSize frameSize) {
 	m_ptsMillis = ptsMillis;
 }
 
-void Frame::ensureSize(const FrameSize frameSize) {
+bool Frame::ensureSize(const FrameSize frameSize) {
 	if (frameSize == m_frameSize) {
-		return;
+		return false;
 	}
 	init(-1, frameSize);
 	std::memset(m_yData, 16, frameSize.luma_width * frameSize.luma_height);
 	std::memset(m_cbData, 128, frameSize.chroma_width * frameSize.chroma_height);
 	std::memset(m_crData, 128, frameSize.chroma_width * frameSize.chroma_height);
+	return true;
 }
 
 uint32_t Mpeg1VideoDecoder::decodeFrame() {
@@ -201,12 +202,17 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 	// The second field of a frame goes into the same frame as the first
 	if (!m_secondField) {
 		m_ptrFrameCurrent->init(m_stream.getPts(0), m_frameSize);
+		m_ptrFrameCurrent->setPicture(m_width, m_height, aspect_ratio);
 	}
 #else
 	m_ptrFrameCurrent->init(m_stream.getPts(0), m_frameSize);
+	m_ptrFrameCurrent->setPicture(m_width, m_height, aspect_ratio);
 #endif
-	m_ptrFramePast->ensureSize(m_frameSize);
-	m_ptrFrameFuture->ensureSize(m_frameSize);
+	for (Frame *reference: {m_ptrFramePast, m_ptrFrameFuture}) {
+		if (reference->ensureSize(m_frameSize)) {
+			reference->setPicture(m_width, m_height, aspect_ratio);
+		}
+	}
 
 	uint32_t m_temporal_reference;
 	PULL2dump1(m_temporal_reference, 10, picture_coding_type, 3, 16);

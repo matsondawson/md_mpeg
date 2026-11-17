@@ -198,12 +198,12 @@ uint32_t Mpeg1VideoDecoder::lastStartCode() const {
 }
 
 /**
- * Converts a decoded frame to 0x00RRGGBB, m_width x m_height pixels packed with no padding.
+ * Converts a decoded frame to 0x00RRGGBB, frame.m_width x frame.m_height pixels packed with no padding.
  * The decoded planes are padded to whole macroblocks, so each plane is read with its own stride.
  */
 void Mpeg1VideoDecoder::generateRgbFrameData(uint32_t *rgbData, const Frame &frame) const {
-	const uint32_t width = m_width;
-	const uint32_t height = m_height;
+	const uint32_t width = frame.m_width;
+	const uint32_t height = frame.m_height;
 	const uint32_t lumaStride = frame.m_frameSize.luma_width;
 	const uint32_t chromaStride = frame.m_frameSize.chroma_width;
 

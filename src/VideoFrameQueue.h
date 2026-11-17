@@ -20,6 +20,8 @@ public:
 		int64_t timelineMs = -1;
 		uint32_t width = 0;
 		uint32_t height = 0;
+		// Pixel height / width, 0 if unknown
+		float pelAspect = 0;
 		std::unique_ptr<uint32_t[]> rgb;
 		size_t capacity = 0;
 	};
@@ -37,7 +39,8 @@ public:
 	 * Adds a frame to the back of the queue.
 	 * @return RGB buffer of width * height pixels for the caller to fill
 	 */
-	uint32_t *push(const int64_t ptsMs, const uint32_t width, const uint32_t height, const int64_t timelineMs = -1) {
+	uint32_t *push(const int64_t ptsMs, const uint32_t width, const uint32_t height, const float pelAspect,
+	               const int64_t timelineMs = -1) {
 		QueuedFrame frame;
 		if (!m_spare.empty()) {
 			frame = std::move(m_spare.back());
@@ -52,6 +55,7 @@ public:
 		frame.timelineMs = timelineMs;
 		frame.width = width;
 		frame.height = height;
+		frame.pelAspect = pelAspect;
 		m_frames.push_back(std::move(frame));
 		return m_frames.back().rgb.get();
 	}
