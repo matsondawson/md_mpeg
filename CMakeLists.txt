@@ -20,7 +20,7 @@ set(MD_MPEG_COMPILE_OPTIONS
 option(MD_MPEG_AUDIO_FIXED_POINT "Decode audio with 32-bit integer arithmetic and output 16-bit samples" ON)
 option(MD_MPEG_SPARSE_IDCT "Skip the IDCT arithmetic for rows and columns with only a first coefficient" ON)
 option(MD_MPEG_AUDIO_MONO "Mix stereo audio to mono before the synthesis filter, halving its work" OFF)
-option(MD_MPEG_ENABLE_MPEG2 "Decode MPEG-2 video and program streams, and A/52 audio, as well as MPEG-1" ON)
+option(MD_MPEG_ENABLE_MPEG2 "Decode MPEG-2 video and program streams, and A/52 and LPCM audio, as well as MPEG-1" ON)
 
 # Demuxing and decoding, no SDL dependency. Shared by the player and the tests.
 add_library(md_mpeg_core STATIC
@@ -31,6 +31,7 @@ add_library(md_mpeg_core STATIC
 	"src/mpeg1/Mpeg2Video.cpp"
 	"src/mpeg1/Mpeg1AudioDecoder.cpp"
 	"src/mpeg1/A52AudioDecoder.cpp"
+	"src/mpeg1/LpcmAudioDecoder.cpp"
 	"src/dvd/Ifo.cpp"
 	"src/dvd/Disc.cpp"
 	"src/dvd/Navigator.cpp"

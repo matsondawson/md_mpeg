@@ -1,11 +1,12 @@
 # MPEG1 Video and Audio Player
 
-This is a C++ application for playing MPEG1 and MPEG2 video with MP2 or A/52 audio.
+This is a C++ application for playing MPEG1 and MPEG2 video with MP2, A/52 or LPCM audio.
 
 ## Features
 
 - Plays MPEG1 and MPEG2 video and MP2 audio from `.mpg` and `.vob` files.
 - Decodes A/52 audio (the usual audio of DVD `.vob` files), downmixing surround to stereo.
+- Decodes DVD LPCM audio: 16, 20 and 24 bits, 48 and 96 kHz, up to 8 channels downmixed to stereo.
 - Plays DVD-Video folders (`VIDEO_TS`) like a DVD player: from the disc's start through its menus, with menu buttons
   chosen by the keyboard or mouse.
 - Supports MPEG-1 and MPEG-2 program streams (`.mpg`, `.vob`), detected per file.
@@ -131,6 +132,12 @@ downmixed to stereo using the stream's centre and surround mix levels, and the l
 left out. Dynamic range compression is applied as the stream asks. It decodes with floating point, so it isn't
 meant for the Pico build.
 
+It also enables the DVD LPCM decoder, for uncompressed audio in private stream 1 (sub-streams 0xA0 to 0xA7): 16, 20
+or 24-bit samples, at 48 or 96 kHz, 1 to 8 channels. The stream doesn't say which channel is which, so 3 to 8
+channels are downmixed to stereo assuming the layouts ffmpeg gives them (2.1, 4.0, 5.0, 5.1, 6.1 and 7.1), with
+the centre and surround channels at -3 dB and the low frequency effects channel left out. Samples carry no sync
+words, so after a seek decoding starts at the first frame the packet header points to.
+
 When a file has several audio streams, the lowest numbered is played, which on a DVD is usually the main
 soundtrack. A .vob file can hold several programs one after another (an intro, then the film) with different
 audio streams; when the playing stream stops, the lowest numbered of those still present takes over.
@@ -143,7 +150,7 @@ subtitle sub-pictures and draws button highlights from the navigation packs. The
 the libdvdread and libdvdnav projects and the DVD-Video pages at dvd.sourceforge.net.
 
 Not supported yet: choosing audio and subtitle streams (the disc's defaults are used, with only forced subtitles
-shown), camera angles (the first is played), LPCM and DTS audio, encrypted (CSS) discs, the navigation timer, and
+shown), camera angles (the first is played), DTS audio, encrypted (CSS) discs, the navigation timer, and
 sub-picture colour changes within a picture. Resuming a title from a menu restarts the cell it was in.
 
 ## Tests
@@ -153,7 +160,8 @@ headless: clean streams, B-frames, odd frame sizes, audio-only and video-only st
 truncated, corrupt and concatenated files, and seeking. MPEG2 clips (progressive, interlaced, the alternate
 coding options, and dual prime if mjpegtools' `mpeg2enc` is installed) are compared picture by picture with
 ffmpeg's decode. A/52 audio (mono, stereo, coupled, short blocks, 5.1 downmixed, 32 to 48 kHz) is compared
-sample by sample with ffmpeg's decode. They are skipped if ffmpeg isn't installed.
+sample by sample with ffmpeg's decode, as is LPCM audio (16, 20 and 24 bits, mono, stereo, 96 kHz, 5.1
+downmixed). They are skipped if ffmpeg isn't installed.
 
 ```bash
 cmake --build build
@@ -164,7 +172,8 @@ ctest --test-dir build --output-on-failure
 
 - `src/md_mpeg.cpp`: the player (SDL window, audio, input, A/V sync)
 - `src/mpeg1/`: program stream demuxer, MPEG-1 video and MP2 audio decoders. `Mpeg2Video.cpp` has the
-  MPEG-2 macroblock layer, `A52AudioDecoder.cpp` the A/52 audio decoder.
+  MPEG-2 macroblock layer, `A52AudioDecoder.cpp` the A/52 audio decoder,
+  `LpcmAudioDecoder.cpp` the DVD LPCM audio decoder.
 - `src/dvd/`: DVD-Video information files, navigation, sub-pictures and navigation packs; `src/DvdPlayer.cpp` plays them
 - `tests/md_mpeg_tests.cpp`: decoder tests
 
@@ -192,7 +201,7 @@ Test media is not included in the repository; put your own files in `testfiles/`
 - Seeking uses a map of the file's timing sampled when it is opened, refined by reading the file around the target, so it
   lands within about a second of the target. Files made of several programs, each starting its clock again (common in
   DVD .vob files), are timed as one timeline.
-- Only supports MPEG1/MPEG2 video, and MP2 (MPEG-1 Layer II) and A/52 audio. MP3, LPCM and DTS audio are not
+- Only supports MPEG1/MPEG2 video, and MP2 (MPEG-1 Layer II), A/52 and LPCM audio. MP3 and DTS audio are not
   supported. MPEG-2 transport streams (`.ts`) are not supported.
 - Raw `.mp2` audio files (without a program stream) are not supported.
 

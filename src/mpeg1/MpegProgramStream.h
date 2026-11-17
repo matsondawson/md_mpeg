@@ -113,8 +113,8 @@ namespace Mpeg1 {
 		// After a seek the input starts mid-packet, so skipping to the first start code isn't corruption
 		bool m_expectSyncSkip = false;
 		// The video and audio streams decoded, 0 until seen. Only the first video stream is decoded, see
-		// selectAudioStream for audio. An A/52 audio stream's code is (PRIVATE_STREAM_1_START_CODE << 8) + its
-		// sub-stream id.
+		// selectAudioStream for audio. An A/52 or LPCM audio stream's code is (PRIVATE_STREAM_1_START_CODE << 8)
+		// + its sub-stream id.
 		uint32_t m_videoStreamCode = 0;
 		uint32_t m_audioStreamCode = 0;
 		// Packs since the last packet of the selected audio stream, and the lowest numbered other stream of its
@@ -132,6 +132,7 @@ namespace Mpeg1 {
 		MStream::IWriteByteStream *m_ptrVideoDecoderStream;
 		MStream::IWriteByteStream *m_ptrAudioDecoderStream;
 		MStream::IWriteByteStream *m_ptrA52DecoderStream;
+		MStream::IWriteByteStream *m_ptrLpcmDecoderStream;
 		// DVD: navigation packs, and the sub-picture stream shown (sub-stream 0x20-0x3F, -1 none)
 		MStream::IWriteByteStream *m_ptrNavigationDecoderStream = nullptr;
 		MStream::IWriteByteStream *m_ptrSubpictureDecoderStream = nullptr;
@@ -150,6 +151,7 @@ namespace Mpeg1 {
 			  , m_ptrVideoDecoderStream(&m_nullDecoderStream)
 			  , m_ptrAudioDecoderStream(&m_nullDecoderStream)
 			  , m_ptrA52DecoderStream(&m_nullDecoderStream)
+			  , m_ptrLpcmDecoderStream(&m_nullDecoderStream)
 			  , m_ptrSelectedAudioDecoderStream(&m_nullDecoderStream) {
 			// empty
 		}
@@ -259,7 +261,8 @@ namespace Mpeg1 {
 								setPacketPts(decodeStreamHeader(true));
 #if MD_MPEG_ENABLE_MPEG2
 							} else if (startCode == PRIVATE_STREAM_1_START_CODE
-							           && (m_ptrA52DecoderStream != &m_nullDecoderStream || m_ptrSubpictureDecoderStream)) {
+							           && (m_ptrA52DecoderStream != &m_nullDecoderStream
+							               || m_ptrLpcmDecoderStream != &m_nullDecoderStream || m_ptrSubpictureDecoderStream)) {
 								decodePrivateStream1Header();
 							} else if (startCode == PRIVATE_STREAM_2_START_CODE && m_ptrNavigationDecoderStream) {
 								m_streamingPacketBytesRemaining = m_buffer.pull(2);
@@ -465,7 +468,8 @@ namespace Mpeg1 {
 #endif
 
 		/**
-		 * Decodes only this audio stream: an MPEG audio stream id (0xC0-0xDF), or an A/52 sub-stream id (0x80-0x87).
+		 * Decodes only this audio stream: an MPEG audio stream id (0xC0-0xDF), or an A/52 (0x80-0x87) or LPCM
+		 * (0xA0-0xA7) sub-stream id.
 		 * 0 chooses automatically (see selectAudioStream).
 		 */
 		void setAudioStream(const uint32_t streamId) {
@@ -531,6 +535,11 @@ namespace Mpeg1 {
 		// Decoder for A/52 audio, in private stream 1. Without one, those streams are skipped.
 		void setA52AudioDecoder(MStream::IWriteByteStream *decoder) {
 			m_ptrA52DecoderStream = decoder;
+		}
+
+		// Decoder for DVD LPCM audio, in private stream 1. Without one, those streams are skipped.
+		void setLpcmAudioDecoder(MStream::IWriteByteStream *decoder) {
+			m_ptrLpcmDecoderStream = decoder;
 		}
 
 		uint32_t pullBits(const uint32_t readBitCount) {
@@ -612,18 +621,19 @@ namespace Mpeg1 {
 		 * number their main soundtrack first. A file can hold several programs one after another with different
 		 * audio streams (DVD .vob files often do), so when the selected stream stops, for about half a second of
 		 * packs, while another of its kind carries on, the lowest numbered of those takes over. Only streams of
-		 * the kind first selected (MPEG audio or A/52) are switched to, as each has its own decoder and output.
+		 * the kind first selected (MPEG audio, A/52 or LPCM) are switched to, as each has its own decoder and
+		 * output.
 		 * @return true if the packet is of the selected stream
 		 */
 		bool selectAudioStream(const uint32_t code) {
 			constexpr uint32_t MISSING_PACKS = 256;
-			const auto isA52 = [](const uint32_t streamCode) { return streamCode > 0xFFFF; };
 			if (m_forcedAudioStreamCode) {
 				if (code != m_forcedAudioStreamCode) {
 					return false;
 				}
-				if (m_audioStreamCode && m_audioStreamCode != code && isA52(code) == isA52(m_audioStreamCode)) {
-					(isA52(code) ? m_ptrA52DecoderStream : m_ptrAudioDecoderStream)->discontinuity();
+				if (m_audioStreamCode && m_audioStreamCode != code
+				    && audioDecoderFor(code) == audioDecoderFor(m_audioStreamCode)) {
+					audioDecoderFor(code)->discontinuity();
 				}
 				m_audioStreamCode = code;
 				return true;
@@ -634,7 +644,7 @@ namespace Mpeg1 {
 				m_lowestOtherAudioStreamCode = 0;
 				return true;
 			}
-			if (isA52(code) != isA52(m_audioStreamCode)) {
+			if (audioDecoderFor(code) != audioDecoderFor(m_audioStreamCode)) {
 				return false;
 			}
 			if (!m_lowestOtherAudioStreamCode || code < m_lowestOtherAudioStreamCode) {
@@ -646,10 +656,19 @@ namespace Mpeg1 {
 				m_packsSinceSelectedAudio = 0;
 				m_lowestOtherAudioStreamCode = 0;
 				// What the decoder has buffered of the previous stream isn't continued by this one
-				(isA52(code) ? m_ptrA52DecoderStream : m_ptrAudioDecoderStream)->discontinuity();
+				audioDecoderFor(code)->discontinuity();
 				return true;
 			}
 			return false;
+		}
+
+		// The decoder of an audio stream code: MPEG audio (0x1C0-0x1DF), or a private stream 1 sub-stream: A/52
+		// (0x80-0x87) or LPCM (0xA0-0xA7)
+		[[nodiscard]] MStream::IWriteByteStream *audioDecoderFor(const uint32_t code) const {
+			if (code <= 0xFFFF) {
+				return m_ptrAudioDecoderStream;
+			}
+			return (code & 0xF8) == 0xA0 ? m_ptrLpcmDecoderStream : m_ptrA52DecoderStream;
 		}
 
 		void setPackTiming(const int32_t scrMillis, const uint32_t programMuxRate) {
@@ -716,7 +735,8 @@ namespace Mpeg1 {
 
 		// The PES header has been read: an A/52 packet starts with its sub-stream id (0x80 to 0x87), the number of
 		// frames that start in it and the position of the first, which aren't needed as the decoder finds frames
-		// itself. Other sub-streams (LPCM, DTS, subtitles) are skipped.
+		// itself. An LPCM packet (0xA0 to 0xA7) has the same fields and 3 more, which its decoder reads, as it needs
+		// them to find frames. Other sub-streams (DTS, SDDS) are skipped.
 		void decodePrivateStream1Header() {
 			m_ptrCurrentDecoderStream = &m_nullDecoderStream;
 			const int32_t pts = decodeStreamHeader(true);
@@ -733,14 +753,21 @@ namespace Mpeg1 {
 				}
 				return;
 			}
-			if (m_streamingPacketBytesRemaining < 4 || m_ptrA52DecoderStream == &m_nullDecoderStream) {
+			const bool lpcm = (subStream & 0xF8) == 0xA0;
+			if ((subStream & 0xF8) != 0x80 && !lpcm) {
 				return;
 			}
-			if ((subStream & 0xF8) != 0x80 || !selectAudioStream(PRIVATE_STREAM_1_START_CODE << 8 | subStream)) {
+			const uint32_t code = PRIVATE_STREAM_1_START_CODE << 8 | subStream;
+			MStream::IWriteByteStream *decoder = audioDecoderFor(code);
+			if (m_streamingPacketBytesRemaining < (lpcm ? 7u : 4u) || decoder == &m_nullDecoderStream
+			    || !selectAudioStream(code)) {
 				return;
 			}
-			skip(4);
-			m_ptrCurrentDecoderStream = m_ptrSelectedAudioDecoderStream = m_ptrA52DecoderStream;
+			skip(lpcm ? 1 : 4);
+			m_ptrCurrentDecoderStream = m_ptrSelectedAudioDecoderStream = decoder;
+			if (lpcm) {
+				decoder->startPacket(m_streamingPacketBytesRemaining);
+			}
 			setPacketPts(pts);
 		}
 #endif

@@ -300,10 +300,11 @@ static constexpr double MIN_SNR_DB = 55.0;
 static constexpr double MIN_A52_SNR_DB = 35.0;
 
 static void checkAudioMatchesFfmpeg(const fs::path &clip, const std::string &referenceName, const uint32_t channels,
-                                    const double minSnrDb = MIN_SNR_DB, const std::string &decoderOptions = "") {
+                                    const double minSnrDb = MIN_SNR_DB, const std::string &decoderOptions = "",
+                                    const std::string &outputOptions = "") {
 	const auto reference = media(referenceName);
 	if (!fs::exists(reference)) {
-		run("ffmpeg -nostdin -y " + decoderOptions + " -i \"" + clip.string() + "\" -vn -f s16le -acodec pcm_s16le \""
+		run("ffmpeg -nostdin -y " + decoderOptions + " -i \"" + clip.string() + "\" -vn " + outputOptions + " -f s16le -acodec pcm_s16le \""
 		    + reference.string() + "\"");
 	}
 	const auto bytes = readFile(reference);
@@ -983,6 +984,113 @@ static void testA52Seek() {
 	p.runUntil();
 	CHECK(p.finished);
 }
+
+// ffmpeg's DVD LPCM encoder, 16 or 24 bits
+static const std::string LPCM16 = " -c:a pcm_dvd -sample_fmt s16 -ar 48000";
+static const std::string LPCM24 = " -c:a pcm_dvd -sample_fmt s32 -ar 48000";
+
+static void testLpcmAudio() {
+	const auto stereo16 = generate("lpcm16.vob", VIDEO_320 + " " + STEREO_SWEEP + " -t 3 -c:v mpeg2video" + LPCM16, "vob");
+	checkAudioMatchesFfmpeg(stereo16, "lpcm16.pcm", 2);
+	const auto stereo24 = generate("lpcm24.vob", STEREO_SWEEP + " -t 3" + LPCM24, "vob");
+	checkAudioMatchesFfmpeg(stereo24, "lpcm24.pcm", 2);
+	const auto mono24 = generate("lpcm24mono.vob", TONE + " -t 3" + LPCM24, "vob");
+	checkAudioMatchesFfmpeg(mono24, "lpcm24mono.pcm", 1);
+
+	const auto p = decode(generate("lpcm96k.vob", STEREO_SWEEP + " -t 3 -c:a pcm_dvd -sample_fmt s32 -ar 96000", "vob"));
+	CHECK(p->finished);
+	CHECK(p->audioFrequency == 96000);
+	CHECK_RANGE(p->audioSeconds(), 2.9, 3.1);
+}
+
+// ffmpeg can't encode 20-bit LPCM, so this builds a DVD-style program stream of it: a sine on the left (and mono)
+// channel, a quieter one on the right, in packets of 5 frames of 80 samples
+static fs::path writeLpcm20(const std::string &name, const uint32_t channels) {
+	constexpr uint32_t FRAME_SAMPLES = 80, FRAMES_PER_PACKET = 5, PACKETS = 180;
+	constexpr double TWO_PI = 6.283185307179586;
+	std::vector<uint8_t> data;
+	uint32_t n = 0;
+	for (uint32_t packet = 0; packet < PACKETS; packet++) {
+		// MPEG-2 pack header, SCR 0
+		data.insert(data.end(), {0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0x01, 0x89, 0xC3, 0xF8});
+		std::vector<uint8_t> payload;
+		for (uint32_t pair = 0; pair < FRAMES_PER_PACKET * FRAME_SAMPLES / 2; pair++) {
+			// 2 samples: the top 16 bits of each value, then their low nibbles
+			std::vector<int32_t> values;
+			for (uint32_t i = 0; i < 2; i++, n++) {
+				values.push_back(static_cast<int32_t>(std::lround(0.8 * 524287 * std::sin(n * TWO_PI * 440 / 48000))));
+				if (channels == 2) {
+					values.push_back(static_cast<int32_t>(std::lround(0.3 * 524287 * std::sin(n * TWO_PI * 1500 / 48000))));
+				}
+			}
+			for (const int32_t value: values) {
+				payload.push_back(static_cast<uint8_t>(value >> 12));
+				payload.push_back(static_cast<uint8_t>(value >> 4));
+			}
+			for (size_t i = 0; i < values.size(); i += 2) {
+				payload.push_back(static_cast<uint8_t>((values[i] & 15) << 4 | (values[i + 1] & 15)));
+			}
+		}
+		const uint64_t pts = 90000 + static_cast<uint64_t>(packet) * FRAMES_PER_PACKET * FRAME_SAMPLES * 90000 / 48000;
+		const std::vector<uint8_t> header = {
+			0x81, 0x80, 5,
+			static_cast<uint8_t>(0x21 | (pts >> 29 & 0x0E)), static_cast<uint8_t>(pts >> 22),
+			static_cast<uint8_t>(pts >> 14 | 1), static_cast<uint8_t>(pts >> 7), static_cast<uint8_t>(pts << 1 | 1),
+			// Sub-stream 0xA0, frames, first access unit pointer, frame number, 20 bits / 48 kHz / channels,
+			// dynamic range
+			0xA0, FRAMES_PER_PACKET, 0, 4, 0, static_cast<uint8_t>(0x40 | (channels - 1)), 0x80};
+		const size_t length = header.size() + payload.size();
+		data.insert(data.end(), {0, 0, 1, 0xBD, static_cast<uint8_t>(length >> 8), static_cast<uint8_t>(length)});
+		data.insert(data.end(), header.begin(), header.end());
+		data.insert(data.end(), payload.begin(), payload.end());
+	}
+	return writeFile(name, data);
+}
+
+static void testLpcm20Bit() {
+	checkAudioMatchesFfmpeg(writeLpcm20("lpcm20.vob", 2), "lpcm20.pcm", 2);
+	checkAudioMatchesFfmpeg(writeLpcm20("lpcm20mono.vob", 1), "lpcm20mono.pcm", 1);
+}
+
+// 5.1 is downmixed to stereo like ffmpeg's resampler does it
+static void testLpcmDownmix() {
+	const auto clip = generate("lpcmsurround.vob", "-f lavfi -i \"aevalsrc=0.5*sin(2*PI*300*t)|0.5*sin(2*PI*500*t)"
+	                                               "|0.5*sin(2*PI*700*t)|0.3*sin(2*PI*50*t)|0.5*sin(2*PI*1100*t)"
+	                                               "|0.5*sin(2*PI*1300*t):s=48000:c=5.1\" -t 3" + LPCM16, "vob");
+	checkAudioMatchesFfmpeg(clip, "lpcmsurround.pcm", 2, MIN_SNR_DB, "", "-ac 2");
+}
+
+// After a seek, decoding starts at the first frame of a packet, not mid-sample
+static void testLpcmSeek() {
+	const auto clip = generate("lpcmlong.vob", VIDEO_320 + " " + TONE + " -t 20 -c:v mpeg2video -bf 2 -g 12" + LPCM16,
+	                           "vob");
+	Pipeline p(clip);
+	p.runUntil(50);
+	p.seekTo(12000);
+	const size_t index = p.displayPts.size();
+	p.runUntil(p.frames + 10);
+	CHECK(p.displayPts.size() > index);
+	CHECK_RANGE(p.audio.firstFramePtsMillis(), 10500, 13500);
+	p.runUntil();
+	CHECK(p.finished);
+	CHECK_RANGE(toneFrequency(p), 430.0, 450.0);
+}
+
+// A DVD chooses its audio stream: A/52 (sub-stream 0x80) or LPCM (0xA0) from the same file
+static void testLpcmChosenStream() {
+	const auto clip = generate("a52lpcm.vob", VIDEO_320 + " -f lavfi -i sine=frequency=440:sample_rate=48000"
+	                                          " -f lavfi -i sine=frequency=1000:sample_rate=48000"
+	                                          " -map 0:v -map 1:a -map 2:a -t 4 -c:v mpeg2video -c:a:0 ac3"
+	                                          " -c:a:1 pcm_dvd -sample_fmt:a:1 s16", "vob");
+	for (const auto &[stream, frequency]: {std::pair{0x80u, 440.0}, std::pair{0xA0u, 1000.0}}) {
+		Pipeline p(clip);
+		p.demux.setAudioStream(stream);
+		p.runUntil();
+		CHECK(p.finished);
+		CHECK_RANGE(p.audioSeconds(), 3.5, 4.5);
+		CHECK_RANGE(toneFrequency(p), frequency * 0.9, frequency * 1.1);
+	}
+}
 #endif
 
 int main(int argc, char *argv[]) {
@@ -1023,6 +1131,11 @@ int main(int argc, char *argv[]) {
 		{"a/52 seek", testA52Seek},
 		{"a/52 stream change", testA52StreamChange},
 		{"a/52 lowest numbered stream", testA52LowestStream},
+		{"lpcm audio", testLpcmAudio},
+		{"lpcm 20-bit", testLpcm20Bit},
+		{"lpcm downmix", testLpcmDownmix},
+		{"lpcm seek", testLpcmSeek},
+		{"lpcm chosen stream", testLpcmChosenStream},
 		{"seek across programs", testTimelineSeek},
 		{"dvd sub-picture", testSubPicture},
 		{"dvd navigation", testDvdNavigation},
