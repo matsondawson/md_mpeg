@@ -241,6 +241,20 @@ void ScreenContextRgbSDL::resetAudio() {
 	SDL_UnlockAudioStream(m_soundStream);
 }
 
+void ScreenContextRgbSDL::closeAudio() {
+	if (m_soundStream) {
+		// Closes the device; the callback isn't running once this returns
+		SDL_DestroyAudioStream(m_soundStream);
+		m_soundStream = nullptr;
+	}
+	m_soundBuffer = nullptr;
+	m_audioPlaying = false;
+	m_stallDetector.reset();
+	std::lock_guard lock(m_audioPositionMutex);
+	m_framesBeforeLastCallback = m_framesAfterLastCallback = 0;
+	m_lastCallbackTimeMs = 0;
+}
+
 std::optional<int64_t> ScreenContextRgbSDL::audioClockMs() {
 	if (!m_audioPlaying) {
 		return std::nullopt;
@@ -415,6 +429,9 @@ InputEvents ScreenContextRgbSDL::eventLoop() {
 						break;
 					case SDLK_PAGEUP:
 						input.chapterSkip--;
+						break;
+					case SDLK_N:
+						input.skip = true;
 						break;
 					case SDLK_ESCAPE:
 					case SDLK_Q:

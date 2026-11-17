@@ -49,6 +49,8 @@ struct InputEvents {
 	bool titleMenu = false;
 	// Page Down / Page Up: next or previous chapter
 	int chapterSkip = 0;
+	// N: skip what is playing on a DVD (e.g. a warning), to where the disc goes after it
+	bool skip = false;
 	// Mouse over the picture: its position in picture pixels, and whether it was clicked (not on the control bar)
 	bool mouseMoved = false;
 	bool mouseClicked = false;
@@ -109,6 +111,8 @@ public:
 	void setAudioPaused(bool paused);
 	// Stops playback and discards all buffered audio (e.g. after seeking). startAudio() restarts it.
 	void resetAudio();
+	// Closes the audio output, so its thread no longer reads the sound buffer. initAudio() opens it again.
+	void closeAudio();
 	// PTS (ms) of the sample currently audible, or nullopt if audio isn't playing, has run dry, or the output
 	// has stalled. Once stalled, buffered audio is discarded so decoding carries on, until resetAudio().
 	[[nodiscard]] std::optional<int64_t> audioClockMs();
@@ -123,4 +127,22 @@ public:
 	void updateControlBar(const ControlBarState &state);
 	// Handles window events, returns the user's input
 	InputEvents eventLoop();
+};
+
+/**
+ * Closes the audio output when it goes out of scope. Declare it after the decoder that owns the sound buffer, so
+ * the audio thread has stopped reading the buffer before the buffer is freed.
+ */
+class AudioOutputCloser {
+public:
+	explicit AudioOutputCloser(ScreenContextRgbSDL &sdl) : m_sdl(sdl) {
+	}
+	~AudioOutputCloser() {
+		m_sdl.closeAudio();
+	}
+	AudioOutputCloser(const AudioOutputCloser &) = delete;
+	AudioOutputCloser &operator=(const AudioOutputCloser &) = delete;
+
+private:
+	ScreenContextRgbSDL &m_sdl;
 };

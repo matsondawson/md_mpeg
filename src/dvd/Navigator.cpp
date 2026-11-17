@@ -714,6 +714,38 @@ namespace Dvd {
 		}
 	}
 
+	void Navigator::skipProgramChain() {
+		m_depth = 0;
+		const Pgc *pgc = m_pgc;
+		if (!pgc || m_domain == Domain::Stopped) {
+			return;
+		}
+		const uint64_t jumpCount = m_jumpCount;
+		// Bounded, for a program chain whose commands loop back into itself
+		for (int i = 0; i < 1000 && m_pgc == pgc && m_domain != Domain::Stopped; i++) {
+			if (m_pgcStill) {
+				pgcStillFinished();
+			} else if (m_cell) {
+				afterCell();
+			} else {
+				break;
+			}
+		}
+		if (m_jumpCount == jumpCount) {
+			// Still in the same program chain: the cell being played is abandoned all the same
+			m_jumpCount++;
+		}
+	}
+
+	bool Navigator::inMenuEntryPgc() const {
+		if ((m_domain != Domain::VideoManagerMenu && m_domain != Domain::TitleSetMenu) || m_pgcNumber < 1) {
+			return false;
+		}
+		const auto *table = pgcTable();
+		return table && m_pgcNumber <= static_cast<int>(table->size()) && (*table)[m_pgcNumber - 1].isEntry()
+		       && (*table)[m_pgcNumber - 1].menuType() >= TITLE_MENU;
+	}
+
 	void Navigator::jumpToCell(const int cell) {
 		m_depth = 0;
 		if (m_pgc && m_domain != Domain::Stopped) {

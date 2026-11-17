@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "PlaybackClock.h"
 #include "Time.h"
 #include "VideoFrameQueue.h"
+#include "dvd/IntroSkipper.h"
 #include "dvd/NavPack.h"
 #include "dvd/Navigator.h"
 #include "dvd/Overlay.h"
@@ -36,15 +38,17 @@ namespace {
 	};
 }
 
-int playDvd(ScreenContextRgbSDL &sdl, const std::string &path) {
+int playDvd(ScreenContextRgbSDL &sdl, const std::string &path, const bool skipIntro) {
 	Dvd::Disc disc(path);
 	Dvd::Navigator nav(disc);
+	Dvd::IntroSkipper introSkipper(skipIntro);
 
 	Mpeg1::MpegProgramStream mps;
 	auto video = std::make_unique<Mpeg1VideoDecoder>();
 	mps.setVideoDecoder(video.get());
 	AudioDecoders audio;
 	audio.attach(mps);
+	const AudioOutputCloser audioCloser(sdl);
 	Dvd::NavPackDecoder navPacks;
 	mps.setNavigationDecoder(&navPacks);
 	Dvd::SubPictureDecoder subpictureDecoder;
@@ -84,6 +88,8 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path) {
 	bool pgcStill = false;
 	// A seek starts the next cell part way through
 	int64_t seekSector = -1;
+	// The program chain whose cells are being read, which navigation packs come from
+	const Dvd::Pgc *readingPgc = nullptr;
 
 	bool quit = false;
 
@@ -198,6 +204,7 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path) {
 	auto beginCell = [&] {
 		pgcStill = false;
 		cellJump = nav.jumpCount();
+		readingPgc = nav.pgc();
 		const auto location = nav.cell();
 		if (!location) {
 			haveCell = false;
@@ -379,6 +386,9 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path) {
 		if (input.titleMenu) {
 			nav.menuCall(Dvd::TITLE_MENU);
 		}
+		if (input.skip && !haveButtons) {
+			nav.skipProgramChain();
+		}
 		if (nav.stopped()) {
 			break;
 		}
@@ -442,6 +452,18 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path) {
 		// --- navigation packs and sub-pictures read
 		for (auto &pci: navPacks.take()) {
 			const auto &h = pci.highlight;
+			// The first navigation pack of a program chain before the first menu: skip it if it is an introduction.
+			// Only while the navigator is still on the program chain being read: once a program chain ends, the
+			// navigator moves on while what was read from it plays out.
+			if (introSkipper.active() && nav.pgc() == readingPgc && nav.jumpCount() == cellJump
+			    && introSkipper.shouldSkip(nav.pgc(), nav.inMenuEntryPgc(), h.status != 0 && !h.buttons.empty())) {
+				std::cout << "DVD: skipped an introduction of " << std::fixed << std::setprecision(1)
+					<< nav.pgc()->playbackTimeMs / 1000.0 << " s" << std::endl;
+				nav.skipProgramChain();
+				resetPipeline();
+				beginCell();
+				break;
+			}
 			if (h.status == 0) {
 				if (haveButtons) overlayDirty = true;
 				haveButtons = false;
