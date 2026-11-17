@@ -152,7 +152,7 @@ namespace MStream {
 				throw MStream::EndOfData();
 			}
 			const auto result = m_buffer[m_readIndex++];
-			if (m_readIndex == size()) {
+			if (m_readIndex == static_cast<int32_t>(RingBufferSize)) {
 				m_readIndex = 0;
 			}
 

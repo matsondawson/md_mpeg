@@ -107,7 +107,7 @@ private:
 public:
 	MStream::RingBufferWithSizeEvent<MD_MPEG_AUDIO_RING_SIZE> m_stream;
 private:
-	MStream::ReadBitStream m_bitStream;
+	MStream::BasicReadBitStream<MStream::RingBufferWithSizeEvent<MD_MPEG_AUDIO_RING_SIZE>> m_bitStream;
 
 public:
 	Mpeg1AudioDecoder();

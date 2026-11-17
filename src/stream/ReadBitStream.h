@@ -7,25 +7,41 @@
 #include "MStream.h"
 
 namespace MStream {
-	class ReadBitStream {
+	// Reads bits from Stream. A concrete final Stream lets the compiler inline its nextByte(), which the bit
+	// reader calls for every 8 bits.
+	template <class Stream>
+	class BasicReadBitStream {
 #ifdef MDEBUG
 	public:
 		uint32_t m_readTotal = 0;
 #endif
 	private:
-		IReadByteStream* m_stream;
+		Stream* m_stream;
 
 		uint32_t next_data;
 		uint32_t next_data_bitcount;
 
+		// Reads bytes until at least bitcount bits are buffered. Out of line, as it's the rare case and the
+		// bit reads are inlined everywhere.
+		__attribute__((noinline)) void refill(const uint32_t bitcount) {
+			do {
+				next_data |= m_stream->nextByte() << (32 - 8 - next_data_bitcount);
+#ifdef MDEBUG
+				m_readTotal++;
+#endif
+				next_data_bitcount += 8;
+				assert(next_data_bitcount <= 32);
+			} while (next_data_bitcount < bitcount);
+		}
+
 	public:
-		explicit ReadBitStream(IReadByteStream* stream)
+		explicit BasicReadBitStream(Stream* stream)
 			: m_stream(stream), next_data(0), next_data_bitcount(0) {
 			// empty
 		}
 
 		// Yup, you can't copy me
-		ReadBitStream(const ReadBitStream& cfileBuffer) = delete;
+		BasicReadBitStream(const BasicReadBitStream& cfileBuffer) = delete;
 
 		/**
 		 * Pulls bits, most significant first.
@@ -35,13 +51,8 @@ namespace MStream {
 		uint32_t pull(const uint32_t bitcount) {
 			assert(bitcount > 0 && bitcount <= 32);
 
-			while (next_data_bitcount < bitcount) {
-				next_data |= m_stream->nextByte() << (32 - 8 - next_data_bitcount);
-#ifdef MDEBUG
-				m_readTotal++;
-#endif
-				next_data_bitcount += 8;
-				assert(next_data_bitcount <= 32);
+			if (next_data_bitcount < bitcount) {
+				refill(bitcount);
 			}
 
 			uint32_t result = SHR(next_data, 32 - bitcount);
@@ -71,13 +82,8 @@ namespace MStream {
 			assert(bitcount > 0);
 			assert(bitcount <= 32);
 
-			while (next_data_bitcount < bitcount) {
-				next_data |= m_stream->nextByte() << (32 - 8 - next_data_bitcount);
-#ifdef MDEBUG
-				m_readTotal++;
-#endif
-				next_data_bitcount += 8;
-				assert(next_data_bitcount <= 32);
+			if (next_data_bitcount < bitcount) {
+				refill(bitcount);
 			}
 
 			return SHR(next_data, 32 - bitcount);
@@ -129,4 +135,6 @@ namespace MStream {
 			}
 		}
 	};
+
+	using ReadBitStream = BasicReadBitStream<IReadByteStream>;
 }

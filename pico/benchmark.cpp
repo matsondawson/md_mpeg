@@ -13,7 +13,9 @@
 #include <malloc.h>
 
 #include "Clocks.h"
+#include "FrameScanner.h"
 #include "hardware/clocks.h"
+#include "hardware/irq.h"
 #include "hardware/timer.h"
 #include "hardware/watchdog.h"
 #include "pico/stdlib.h"
@@ -25,6 +27,7 @@
 extern "C" const uint8_t clip_start[];
 extern "C" const uint8_t clip_end[];
 extern "C" char __StackBottom;
+extern "C" char __flash_binary_start, __data_start__, __data_end__;
 
 // Progress, printed by a timer so a stuck decoder still reports where it is
 static volatile uint32_t g_calls, g_frames, g_samples;
@@ -45,6 +48,90 @@ extern "C" __attribute__((used)) void hardFaultReport(const uint32_t *frame) {
 
 extern "C" __attribute__((naked)) void isr_hardfault() {
 	__asm volatile("mrs r0, msp\n bl hardFaultReport\n");
+}
+
+// Sampling profiler: a timer alarm interrupts core 0 and counts the interrupted program counter in a histogram,
+// one for code in flash up to the clip and one for code in RAM. pico/profile.py turns it into functions.
+namespace profiler {
+	constexpr uint32_t ALARM = 1;
+#if PICO_RP2040
+	constexpr uint32_t ALARM_IRQ = TIMER_IRQ_1;
+#else
+	constexpr uint32_t ALARM_IRQ = TIMER0_IRQ_1;
+#endif
+	constexpr uint32_t PERIOD_US = 200;
+	constexpr uint32_t BUCKET_SHIFT = 4;
+
+	uint16_t *flashCounts, *ramCounts;
+	uint32_t flashBuckets, ramBuckets;
+	volatile uint32_t samples, missed;
+	volatile bool running;
+
+	extern "C" __attribute__((used)) void profileSample(const uint32_t *frame) {
+		timer_hw->intr = 1u << ALARM;
+		if (running) {
+			timer_hw->alarm[ALARM] = timer_hw->timerawl + PERIOD_US;
+		}
+		const uint32_t pc = frame[6];
+		const auto flashStart = reinterpret_cast<uint32_t>(&__flash_binary_start);
+		const auto ramStart = reinterpret_cast<uint32_t>(&__data_start__);
+		uint16_t *count = nullptr;
+		if (pc - flashStart < flashBuckets << BUCKET_SHIFT) {
+			count = &flashCounts[(pc - flashStart) >> BUCKET_SHIFT];
+		} else if (pc - ramStart < ramBuckets << BUCKET_SHIFT) {
+			count = &ramCounts[(pc - ramStart) >> BUCKET_SHIFT];
+		}
+		if (count && *count != 0xFFFF) {
+			++*count;
+		} else {
+			missed = missed + 1;
+		}
+		samples = samples + 1;
+	}
+
+	// The exception frame is on the main stack, as the Pico runs everything on it
+	extern "C" __attribute__((naked)) void profileIrq() {
+		__asm volatile("mrs r0, msp\n ldr r1, =profileSample\n bx r1\n .ltorg\n");
+	}
+
+	bool allocate() {
+		flashBuckets = (reinterpret_cast<uint32_t>(clip_start) - reinterpret_cast<uint32_t>(&__flash_binary_start)) >> BUCKET_SHIFT;
+		ramBuckets = (reinterpret_cast<uint32_t>(&__data_end__) - reinterpret_cast<uint32_t>(&__data_start__)) >> BUCKET_SHIFT;
+		flashCounts = static_cast<uint16_t *>(calloc(flashBuckets, sizeof(uint16_t)));
+		ramCounts = static_cast<uint16_t *>(calloc(ramBuckets, sizeof(uint16_t)));
+		return flashCounts && ramCounts;
+	}
+
+	void start() {
+		samples = missed = 0;
+		hardware_alarm_claim(ALARM);
+		irq_set_exclusive_handler(ALARM_IRQ, profileIrq);
+		timer_hw->inte |= 1u << ALARM;
+		irq_set_enabled(ALARM_IRQ, true);
+		running = true;
+		timer_hw->alarm[ALARM] = timer_hw->timerawl + PERIOD_US;
+	}
+
+	void stop() {
+		running = false;
+		irq_set_enabled(ALARM_IRQ, false);
+		timer_hw->inte &= ~(1u << ALARM);
+		timer_hw->intr = 1u << ALARM;
+	}
+
+	void print(const char *name) {
+		printf("profile: %s, %lu samples, %lu missed, %u byte buckets\n", name, samples, missed, 1u << BUCKET_SHIFT);
+		const auto dump = [](const uint16_t *counts, const uint32_t buckets, const uint32_t base) {
+			for (uint32_t i = 0; i < buckets; i++) {
+				if (counts[i]) {
+					printf("P %08lx %u\n", base + (i << BUCKET_SHIFT), counts[i]);
+				}
+			}
+		};
+		dump(flashCounts, flashBuckets, reinterpret_cast<uint32_t>(&__flash_binary_start));
+		dump(ramCounts, ramBuckets, reinterpret_cast<uint32_t>(&__data_start__));
+		printf("profile end\n");
+	}
 }
 
 namespace {
@@ -178,12 +265,16 @@ namespace {
 		uint32_t singleCoreBehindUs = 0;
 		uint64_t videoHash = 14695981039346656037ULL;
 		uint64_t audioHash = 14695981039346656037ULL;
+		// Converting and scaling each frame to the screen, as the video player's core 1 does
+		uint64_t screenHash = 14695981039346656037ULL;
+		uint64_t screenUs = 0;
+		uint32_t screenMaxUs = 0;
 		uint32_t heapArena = 0;
 		uint32_t heapUsed = 0;
 		const char *error = "";
 	};
 
-	__attribute__((noinline)) void run(Result &result, const bool hash) {
+	__attribute__((noinline)) void run(Result &result, const bool hash, const bool screen = false) {
 		ClipStream clip;
 		auto demuxer = std::make_unique<Mpeg1::MpegProgramStream>();
 		auto videoDecoder = std::make_unique<Mpeg1VideoDecoder>();
@@ -203,10 +294,29 @@ namespace {
 		videoDecoder->setFrameCallback([&](const Frame &frame) {
 			result.frames++;
 			g_frames = result.frames;
-			if (hash) {
-				rgb.resize(frame.m_width * frame.m_height);
-				videoDecoder->generateRgbFrameData(rgb.data(), frame);
-				result.videoHash = fnv(result.videoHash, rgb.data(), rgb.size() * sizeof(uint32_t));
+			if (hash || screen) {
+				if (hash) {
+					rgb.resize(frame.m_width * frame.m_height);
+					videoDecoder->generateRgbFrameData(rgb.data(), frame);
+					result.videoHash = fnv(result.videoHash, rgb.data(), rgb.size() * sizeof(uint32_t));
+				}
+				if (frame.m_width != s_plan.sourceWidth || frame.m_height != s_plan.sourceHeight) {
+					buildPlan(frame.m_width, frame.m_height);
+				}
+				static FrameScanner scanner;
+				alignas(4) static uint16_t line[SCREEN_WIDTH];
+				uint32_t screenUs = 0;
+				scanner.begin(frame);
+				for (uint32_t y = 0; y < SCREEN_HEIGHT; y++) {
+					const auto lineStart = micros();
+					scanner.line(y, line);
+					screenUs += micros() - lineStart;
+					if (hash) {
+						result.screenHash = fnv(result.screenHash, line, s_plan.outputWidth * sizeof(uint16_t));
+					}
+				}
+				result.screenUs += screenUs;
+				result.screenMaxUs = std::max(result.screenMaxUs, screenUs);
 				return;
 			}
 			const auto wall = micros();
@@ -341,8 +451,19 @@ int main() {
 	}
 
 	printf("Hashing output...\n");
+	initTables();
 	Result hashed;
 	run(hashed, true);
+
+	// Decoding and converting each frame for the screen
+	Result profiled;
+	const bool profiling = clockSet && profiler::allocate();
+	if (profiling) {
+		printf("Profiling...\n");
+		profiler::start();
+		run(profiled, false, true);
+		profiler::stop();
+	}
 
 	for (;;) {
 		printf("\n==== md_mpeg %s benchmark, clip %u bytes ====\n", CHIP_NAME, static_cast<unsigned>(clip_end - clip_start));
@@ -355,6 +476,12 @@ int main() {
 		       atDefault.heapArena, atDefault.heapUsed, bootHeapUsed, stackBytes, PICO_STACK_SIZE);
 		printf("output: video %016llx audio %016llx frames %lu samples %llu%s%s\n", hashed.videoHash, hashed.audioHash, hashed.frames, hashed.samples,
 		       *hashed.error ? " " : "", hashed.error);
+		printf("screen at %lu MHz: %.2f ms per frame average, %.2f ms slowest, output %016llx\n", clock_get_hz(clk_sys) / 1000000,
+		       hashed.frames ? static_cast<double>(hashed.screenUs) / 1000.0 / hashed.frames : 0.0,
+		       static_cast<double>(hashed.screenMaxUs) / 1000.0, hashed.screenHash);
+		if (profiling) {
+			profiler::print("decode");
+		}
 		printf("==== end ====\n");
 		fflush(stdout);
 		sleep_ms(3000);
