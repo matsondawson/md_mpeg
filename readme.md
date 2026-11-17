@@ -6,6 +6,8 @@ This is a C++ application for playing MPEG1 and MPEG2 video with MP2 or A/52 aud
 
 - Plays MPEG1 and MPEG2 video and MP2 audio from `.mpg` and `.vob` files.
 - Decodes A/52 audio (the usual audio of DVD `.vob` files), downmixing surround to stereo.
+- Plays DVD-Video folders (`VIDEO_TS`) like a DVD player: from the disc's start through its menus, with menu buttons
+  chosen by the keyboard or mouse.
 - Supports MPEG-1 and MPEG-2 program streams (`.mpg`, `.vob`), detected per file.
 - MPEG2 main profile video: progressive and interlaced, frame and field pictures, 3:2 pulldown timing.
 - Audio/video sync using the audio as the master clock; falls back to the wall clock for files with no audio, or once the audio ends.
@@ -57,6 +59,14 @@ Run the player with an MPEG-PS (`.mpg`) file as an argument:
 ./build/md_mpeg <path-to-video.mpg>
 ```
 
+To play a DVD with its menus, pass its `VIDEO_TS` folder, the folder holding it, or its `VIDEO_TS.IFO`:
+
+```bash
+./build/md_mpeg <path-to-dvd-folder>
+```
+
+A single `.vob` file plays as a program stream, without menus.
+
 ### Controls
 
 | Key | Action |
@@ -65,6 +75,15 @@ Run the player with an MPEG-PS (`.mpg`) file as an argument:
 | Left / Right | Seek back / forward 10 seconds |
 | Down / Up | Seek back / forward 60 seconds |
 | Escape or Q | Quit |
+
+Playing a DVD folder:
+
+| Key | Action |
+|---|---|
+| Arrow keys | In a menu, move between buttons; in a title, seek as above |
+| Enter, or click | Choose the menu button (moving the mouse over a button selects it) |
+| M / T | Root menu / title menu |
+| Page Down / Page Up | Next / previous chapter |
 
 ### Install and "Open with"
 
@@ -116,6 +135,17 @@ When a file has several audio streams, the lowest numbered is played, which on a
 soundtrack. A .vob file can hold several programs one after another (an intro, then the film) with different
 audio streams; when the playing stream stops, the lowest numbered of those still present takes over.
 
+## DVD-Video
+
+DVD folders are played with the MPEG-2 option. `src/dvd/` reads the information files (`.IFO`, falling back to the
+`.BUP` copies), runs the discs' navigation commands from First Play through menus and titles, decodes menu button and
+subtitle sub-pictures and draws button highlights from the navigation packs. The formats follow the documentation of
+the libdvdread and libdvdnav projects and the DVD-Video pages at dvd.sourceforge.net.
+
+Not supported yet: choosing audio and subtitle streams (the disc's defaults are used, with only forced subtitles
+shown), camera angles (the first is played), LPCM and DTS audio, encrypted (CSS) discs, the navigation timer, and
+sub-picture colour changes within a picture. Resuming a title from a menu restarts the cell it was in.
+
 ## Tests
 
 The tests generate small test clips with ffmpeg (no media is stored in the repository) and decode them
@@ -135,6 +165,7 @@ ctest --test-dir build --output-on-failure
 - `src/md_mpeg.cpp`: the player (SDL window, audio, input, A/V sync)
 - `src/mpeg1/`: program stream demuxer, MPEG-1 video and MP2 audio decoders. `Mpeg2Video.cpp` has the
   MPEG-2 macroblock layer, `A52AudioDecoder.cpp` the A/52 audio decoder.
+- `src/dvd/`: DVD-Video information files, navigation, sub-pictures and navigation packs; `src/DvdPlayer.cpp` plays them
 - `tests/md_mpeg_tests.cpp`: decoder tests
 
 ## Encoding Compatible Files

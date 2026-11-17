@@ -38,6 +38,20 @@ struct InputEvents {
 	int32_t seekSeconds = 0;
 	// 0..1 of the way through the file, -1 if no seek bar click
 	double seekFraction = -1;
+
+	// Arrow keys pressed (they also seek, see seekSeconds), for DVD menus
+	int up = 0, down = 0, left = 0, right = 0;
+	// Enter: activate the selected menu button
+	bool activate = false;
+	// M: DVD root menu, T: DVD title menu
+	bool rootMenu = false;
+	bool titleMenu = false;
+	// Page Down / Page Up: next or previous chapter
+	int chapterSkip = 0;
+	// Mouse over the picture: its position in picture pixels, and whether it was clicked (not on the control bar)
+	bool mouseMoved = false;
+	bool mouseClicked = false;
+	int mouseX = -1, mouseY = -1;
 };
 
 class ScreenContextRgbSDL : public ScreenContext {
@@ -50,6 +64,11 @@ private:
 	// Display width / height of the picture, 0 to show its pixels square
 	double m_displayAspect = 0;
 	ControlBar m_controlBar;
+	// Where the picture was last drawn in the window surface
+	SDL_Rect m_pictureRect{};
+
+	// Converts window coordinates to picture pixels, false if outside the picture
+	bool pictureCoordinates(float windowX, float windowY, int &x, int &y) const;
 
 public:
 	SDL_AudioStream* m_soundStream{};

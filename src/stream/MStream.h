@@ -47,6 +47,9 @@ namespace MStream {
 		// The data written next doesn't continue what was written before (e.g. another audio stream takes over)
 		virtual void discontinuity() {
 		}
+		// A packet of length bytes follows, for streams without a PES header that marks packets
+		virtual void startPacket(uint32_t length) {
+		}
 	};
 
 	/*

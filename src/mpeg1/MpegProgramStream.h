@@ -32,6 +32,8 @@ namespace Mpeg1 {
 	constexpr uint32_t PADDING_STREAM_START_CODE = 0x000001BE;
 	// Carries A/52 audio, among other things, in sub-streams
 	constexpr uint32_t PRIVATE_STREAM_1_START_CODE = 0x000001BD;
+	// Carries DVD navigation packs
+	constexpr uint32_t PRIVATE_STREAM_2_START_CODE = 0x000001BF;
 	constexpr uint32_t VIDEO_STREAM_1_START_CODE = 0x000001E0;
 	constexpr uint32_t AUDIO_STREAM_1_START_CODE = 0x000001C0;
 	// Lowest stream id; every start code from here up is a packet with a 16-bit length
@@ -130,6 +132,12 @@ namespace Mpeg1 {
 		MStream::IWriteByteStream *m_ptrVideoDecoderStream;
 		MStream::IWriteByteStream *m_ptrAudioDecoderStream;
 		MStream::IWriteByteStream *m_ptrA52DecoderStream;
+		// DVD: navigation packs, and the sub-picture stream shown (sub-stream 0x20-0x3F, -1 none)
+		MStream::IWriteByteStream *m_ptrNavigationDecoderStream = nullptr;
+		MStream::IWriteByteStream *m_ptrSubpictureDecoderStream = nullptr;
+		int m_subpictureStreamId = -1;
+		// The audio stream to decode, chosen by the caller (e.g. a DVD's navigation), 0 to choose automatically
+		uint32_t m_forcedAudioStreamCode = 0;
 		// The decoder of the audio stream being decoded
 		MStream::IWriteByteStream *m_ptrSelectedAudioDecoderStream;
 
@@ -251,8 +259,12 @@ namespace Mpeg1 {
 								setPacketPts(decodeStreamHeader(true));
 #if MD_MPEG_ENABLE_MPEG2
 							} else if (startCode == PRIVATE_STREAM_1_START_CODE
-							           && m_ptrA52DecoderStream != &m_nullDecoderStream) {
+							           && (m_ptrA52DecoderStream != &m_nullDecoderStream || m_ptrSubpictureDecoderStream)) {
 								decodePrivateStream1Header();
+							} else if (startCode == PRIVATE_STREAM_2_START_CODE && m_ptrNavigationDecoderStream) {
+								m_streamingPacketBytesRemaining = m_buffer.pull(2);
+								m_ptrCurrentDecoderStream = m_ptrNavigationDecoderStream;
+								m_ptrCurrentDecoderStream->startPacket(m_streamingPacketBytesRemaining);
 #endif
 							} else {
 								// Padding, private, additional or unsupported streams: skip the packet
@@ -439,6 +451,28 @@ namespace Mpeg1 {
 			}
 		}
 
+#if MD_MPEG_ENABLE_MPEG2
+		// DVD navigation packs (private stream 2) go to decoder, which is told where each packet starts
+		void setNavigationDecoder(MStream::IWriteByteStream *decoder) {
+			m_ptrNavigationDecoderStream = decoder;
+		}
+
+		// Sub-picture sub-stream id (0x20-0x3F) to send to decoder, -1 for none
+		void setSubpictureDecoder(MStream::IWriteByteStream *decoder, const int subStreamId) {
+			m_ptrSubpictureDecoderStream = decoder;
+			m_subpictureStreamId = subStreamId;
+		}
+#endif
+
+		/**
+		 * Decodes only this audio stream: an MPEG audio stream id (0xC0-0xDF), or an A/52 sub-stream id (0x80-0x87).
+		 * 0 chooses automatically (see selectAudioStream).
+		 */
+		void setAudioStream(const uint32_t streamId) {
+			m_forcedAudioStreamCode = streamId >= 0xC0 ? 0x100 | streamId
+			                          : streamId ? PRIVATE_STREAM_1_START_CODE << 8 | streamId : 0;
+		}
+
 		[[nodiscard]] const ProgramTimeline &timeline() const {
 			return m_timeline;
 		}
@@ -584,6 +618,16 @@ namespace Mpeg1 {
 		bool selectAudioStream(const uint32_t code) {
 			constexpr uint32_t MISSING_PACKS = 256;
 			const auto isA52 = [](const uint32_t streamCode) { return streamCode > 0xFFFF; };
+			if (m_forcedAudioStreamCode) {
+				if (code != m_forcedAudioStreamCode) {
+					return false;
+				}
+				if (m_audioStreamCode && m_audioStreamCode != code && isA52(code) == isA52(m_audioStreamCode)) {
+					(isA52(code) ? m_ptrA52DecoderStream : m_ptrAudioDecoderStream)->discontinuity();
+				}
+				m_audioStreamCode = code;
+				return true;
+			}
 			if (!m_audioStreamCode || code == m_audioStreamCode) {
 				m_audioStreamCode = code;
 				m_packsSinceSelectedAudio = 0;
@@ -676,10 +720,22 @@ namespace Mpeg1 {
 		void decodePrivateStream1Header() {
 			m_ptrCurrentDecoderStream = &m_nullDecoderStream;
 			const int32_t pts = decodeStreamHeader(true);
-			if (m_streamingPacketBytesRemaining < 4) {
+			if (m_streamingPacketBytesRemaining < 1) {
 				return;
 			}
 			const uint32_t subStream = peek();
+			if ((subStream & 0xE0) == 0x20) {
+				// Sub-picture: just the sub-stream id before the data
+				if (m_ptrSubpictureDecoderStream && static_cast<int>(subStream) == m_subpictureStreamId) {
+					skip(1);
+					m_ptrCurrentDecoderStream = m_ptrSubpictureDecoderStream;
+					setPacketPts(pts);
+				}
+				return;
+			}
+			if (m_streamingPacketBytesRemaining < 4 || m_ptrA52DecoderStream == &m_nullDecoderStream) {
+				return;
+			}
 			if ((subStream & 0xF8) != 0x80 || !selectAudioStream(PRIVATE_STREAM_1_START_CODE << 8 | subStream)) {
 				return;
 			}

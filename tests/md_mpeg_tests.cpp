@@ -22,6 +22,10 @@
 #include "mpeg1/MpegProgramStream.h"
 #include "mpeg1/Mpeg1VideoDecoder.h"
 #include "mpeg1/AudioDecoders.h"
+#if MD_MPEG_ENABLE_MPEG2
+#include "dvd/Navigator.h"
+#include "dvd/SubPicture.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -800,6 +804,173 @@ static void testTimelineSeek() {
 	}
 }
 
+// ---------------------------------------------------------------- DVD
+
+// A sub-picture unit coded by hand: 4x2 pixels, both fields' line "0 1 2 3"
+static void testSubPicture() {
+	const std::vector<uint8_t> unit = {
+		0x00, 0x1E, // unit size
+		0x00, 0x06, // control sequence offset
+		// Pixel data: runs of 1 pixel, one nibble each (run << 2 | value): values 0, 1, 2, 3
+		0x45, 0x67,
+		// Control sequence: delay 0, next = itself, commands
+		0x00, 0x00, 0x00, 0x06,
+		0x01, // start display
+		0x03, 0x32, 0x10, // colours: pixel 3 -> 3, 2 -> 2, 1 -> 1, 0 -> 0
+		0x04, 0xFF, 0xF0, // contrast: pixel 0 transparent
+		0x05, 0x00, 0x00, 0x03, 0x00, 0x00, 0x01, // area x 0-3, y 0-1
+		0x06, 0x00, 0x04, 0x00, 0x04, // both fields from offset 4
+		0xFF,
+	};
+	Dvd::SubPicture picture;
+	CHECK(Dvd::decodeSubPicture(unit, picture));
+	CHECK(picture.width == 4);
+	CHECK(picture.height == 2);
+	CHECK((picture.pixels == std::vector<uint8_t>{0, 1, 2, 3, 0, 1, 2, 3}));
+	CHECK(picture.contrast[0] == 0 && picture.contrast[3] == 15);
+	CHECK(picture.colors[2] == 2);
+}
+
+// Builds .IFO files: big-endian values at byte offsets
+struct IfoBuilder {
+	std::vector<uint8_t> data;
+
+	explicit IfoBuilder(const size_t sectors) : data(sectors * Dvd::SECTOR_SIZE) {
+	}
+
+	void u8(const size_t offset, const uint32_t value) { data[offset] = static_cast<uint8_t>(value); }
+	void u16(const size_t offset, const uint32_t value) { u8(offset, value >> 8); u8(offset + 1, value); }
+	void u32(const size_t offset, const uint32_t value) { u16(offset, value >> 16); u16(offset + 2, value); }
+	void bytes(const size_t offset, const std::vector<uint8_t> &values) {
+		std::copy(values.begin(), values.end(), data.begin() + static_cast<std::ptrdiff_t>(offset));
+	}
+
+	struct CellSpec {
+		uint32_t first, last;
+		uint8_t still;
+	};
+
+	// Writes a program chain at offset: cells (one program each), commands
+	void pgc(const size_t at, const std::vector<CellSpec> &cells, const std::vector<std::vector<uint8_t>> &pre,
+	         const std::vector<std::vector<uint8_t>> &post) {
+		u8(at + 2, cells.size());
+		u8(at + 3, cells.size());
+		size_t offset = 0xEC;
+		u16(at + 0xE4, offset);
+		u16(at + offset, pre.size());
+		u16(at + offset + 2, post.size());
+		size_t command = at + offset + 8;
+		for (const auto &c: pre) { bytes(command, c); command += 8; }
+		for (const auto &c: post) { bytes(command, c); command += 8; }
+		offset = command - at;
+		u16(at + 0xE6, offset);
+		for (size_t i = 0; i < cells.size(); i++) u8(at + offset + i, i + 1);
+		offset += cells.size() + 1;
+		u16(at + 0xE8, offset);
+		for (size_t i = 0; i < cells.size(); i++) {
+			u8(at + offset + i * 24 + 2, cells[i].still);
+			u32(at + offset + i * 24 + 8, cells[i].first);
+			u32(at + offset + i * 24 + 20, cells[i].last);
+		}
+		offset += cells.size() * 24;
+		u16(at + 0xEA, offset);
+		for (size_t i = 0; i < cells.size(); i++) {
+			u16(at + offset + i * 4, 1);
+			u8(at + offset + i * 4 + 3, i + 1);
+		}
+	}
+
+	void save(const fs::path &path) const {
+		std::ofstream out(path, std::ios::binary);
+		out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+	}
+};
+
+// A disc with First Play commands, a two chapter title and a title menu, written as .IFO files
+static void testDvdNavigation() {
+	const auto folder = media("dvd") / "VIDEO_TS";
+	fs::create_directories(folder);
+
+	IfoBuilder vmg(3);
+	vmg.bytes(0, {'D', 'V', 'D', 'V', 'I', 'D', 'E', 'O', '-', 'V', 'M', 'G'});
+	vmg.u16(0x3E, 1);
+	vmg.u32(0x84, 0x400);
+	vmg.u32(0xC4, 1);
+	vmg.u32(0xC8, 2);
+	vmg.pgc(0x400, {}, {
+		        {0x71, 0x00, 0x00, 0x01, 0x00, 0x05, 0x00, 0x00}, // GPRM1 = 5
+		        {0x73, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00}, // GPRM1 += 3
+		        {0x00, 0xA1, 0x00, 0x01, 0x00, 0x08, 0x00, 0x05}, // if GPRM1 == 8 goto 5
+		        {0x30, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // exit (skipped)
+		        {0x30, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00}, // jump to title 1
+	        }, {});
+	// Title table: one title, 2 chapters, title set 1 title 1
+	vmg.u16(0x800, 1);
+	vmg.u8(0x808 + 1, 1);
+	vmg.u16(0x808 + 2, 2);
+	vmg.u8(0x808 + 6, 1);
+	vmg.u8(0x808 + 7, 1);
+	// Menus: one language unit with a title menu, a still cell
+	vmg.u16(0x1000, 1);
+	vmg.bytes(0x1008, {'e', 'n'});
+	vmg.u32(0x1008 + 4, 16);
+	vmg.u16(0x1010, 1);
+	vmg.u8(0x1018, 0x82);
+	vmg.u32(0x1018 + 4, 16);
+	vmg.pgc(0x1020, {{0, 0, 255}}, {}, {});
+	vmg.save(folder / "VIDEO_TS.IFO");
+
+	IfoBuilder vts(3);
+	vts.bytes(0, {'D', 'V', 'D', 'V', 'I', 'D', 'E', 'O', '-', 'V', 'T', 'S'});
+	vts.u32(0xC8, 1);
+	vts.u32(0xCC, 2);
+	// Chapters of title 1: programs 1 and 2 of PGC 1
+	vts.u16(0x800, 1);
+	vts.u32(0x804, 19);
+	vts.u32(0x808, 12);
+	vts.u16(0x80C, 1);
+	vts.u16(0x80E, 1);
+	vts.u16(0x810, 1);
+	vts.u16(0x812, 2);
+	vts.u16(0x1000, 1);
+	vts.u8(0x1008, 0x81);
+	vts.u32(0x1008 + 4, 16);
+	vts.pgc(0x1010, {{0, 9, 0}, {10, 19, 0}}, {}, {
+		        {0x30, 0x06, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00}, // to the video manager's title menu
+	        });
+	vts.save(folder / "VTS_01_0.IFO");
+
+	CHECK(Dvd::Disc::isDvd(media("dvd").string()));
+	Dvd::Disc disc(media("dvd").string());
+	Dvd::Navigator nav(disc);
+	nav.start();
+	CHECK(nav.domain() == Dvd::Domain::Title);
+	CHECK(nav.gprm(1) == 8);
+	CHECK(nav.cellNumber() == 1);
+	CHECK(nav.sprm(4) == 1);
+	nav.cellFinished();
+	CHECK(nav.cellNumber() == 2);
+	CHECK(nav.sprm(7) == 2);
+
+	// The menu, then resume
+	nav.menuCall(Dvd::TITLE_MENU);
+	CHECK(nav.domain() == Dvd::Domain::VideoManagerMenu);
+	CHECK(nav.cell() && nav.cell()->stillTime == 255);
+	nav.buttonActivated({0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10});
+	CHECK(nav.domain() == Dvd::Domain::Title);
+	CHECK(nav.cellNumber() == 2);
+
+	// The end of the title runs its post command
+	nav.cellFinished();
+	CHECK(nav.domain() == Dvd::Domain::VideoManagerMenu);
+	// A menu button jumps to the title's second chapter
+	nav.buttonActivated({0x30, 0x05, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00});
+	CHECK(nav.domain() == Dvd::Domain::Title);
+	CHECK(nav.cellNumber() == 2);
+	nav.previousChapter();
+	CHECK(nav.cellNumber() == 1);
+}
+
 static void testA52Seek() {
 	const auto clip = generate("a52long.vob", VIDEO_320 + " " + TONE + " -t 20 -c:v mpeg2video -bf 2 -g 12" + A52, "vob");
 	Pipeline p(clip);
@@ -853,6 +1024,8 @@ int main(int argc, char *argv[]) {
 		{"a/52 stream change", testA52StreamChange},
 		{"a/52 lowest numbered stream", testA52LowestStream},
 		{"seek across programs", testTimelineSeek},
+		{"dvd sub-picture", testSubPicture},
+		{"dvd navigation", testDvdNavigation},
 #endif
 	};
 	for (const auto &[name, test] : tests) {
