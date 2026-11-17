@@ -43,8 +43,15 @@ function(use_display name)
 	target_link_libraries(${name} PRIVATE hardware_dma hardware_i2c hardware_spi)
 endfunction()
 set(MD_MPEG_CLIP_DIR "" CACHE PATH "Directory holding clip.mpg, the clip to embed")
-option(MD_MPEG_IDCT_M0 "Use the Cortex-M0+ assembler IDCT, pico/idct_m0.S" ON)
-option(MD_MPEG_PREDICT_M0 "Use the Cortex-M0+ assembler motion compensation, pico/predict_m0.S" ON)
+# The Cortex-M0+ assembler, written and measured on the RP2040. It would run on the RP2350's Cortex-M33, which
+# has better instructions for both, so it's off there.
+if(PICO_BOARD STREQUAL "pico2")
+	set(MD_MPEG_M0_ASM_DEFAULT OFF)
+else()
+	set(MD_MPEG_M0_ASM_DEFAULT ON)
+endif()
+option(MD_MPEG_IDCT_M0 "Use the Cortex-M0+ assembler IDCT, pico/idct_m0.S" ${MD_MPEG_M0_ASM_DEFAULT})
+option(MD_MPEG_PREDICT_M0 "Use the Cortex-M0+ assembler motion compensation, pico/predict_m0.S" ${MD_MPEG_M0_ASM_DEFAULT})
 option(MD_MPEG_SPARSE_IDCT "Skip the IDCT arithmetic for rows and columns with only a first coefficient" ON)
 # The Pico's audio output is mono
 option(MD_MPEG_AUDIO_MONO "Mix stereo audio to mono before the synthesis filter, halving its work" ON)

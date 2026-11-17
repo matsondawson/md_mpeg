@@ -54,6 +54,11 @@ extern "C" __attribute__((naked)) void isr_hardfault() {
 // one for code in flash up to the clip and one for code in RAM. pico/profile.py turns it into functions.
 namespace profiler {
 	constexpr uint32_t ALARM = 1;
+#if PICO_RP2040
+	constexpr uint32_t ALARM_IRQ = TIMER_IRQ_1;
+#else
+	constexpr uint32_t ALARM_IRQ = TIMER0_IRQ_1;
+#endif
 	constexpr uint32_t PERIOD_US = 200;
 	constexpr uint32_t BUCKET_SHIFT = 4;
 
@@ -100,16 +105,16 @@ namespace profiler {
 	void start() {
 		samples = missed = 0;
 		hardware_alarm_claim(ALARM);
-		irq_set_exclusive_handler(TIMER_IRQ_1, profileIrq);
+		irq_set_exclusive_handler(ALARM_IRQ, profileIrq);
 		timer_hw->inte |= 1u << ALARM;
-		irq_set_enabled(TIMER_IRQ_1, true);
+		irq_set_enabled(ALARM_IRQ, true);
 		running = true;
 		timer_hw->alarm[ALARM] = timer_hw->timerawl + PERIOD_US;
 	}
 
 	void stop() {
 		running = false;
-		irq_set_enabled(TIMER_IRQ_1, false);
+		irq_set_enabled(ALARM_IRQ, false);
 		timer_hw->inte &= ~(1u << ALARM);
 		timer_hw->intr = 1u << ALARM;
 	}
