@@ -27,6 +27,12 @@ Mpeg1VideoDecoder::Mpeg1VideoDecoder()
 	  , next_start_code(-1) {
 }
 
+Mpeg1VideoDecoder::~Mpeg1VideoDecoder() {
+	delete m_ptrFramePast;
+	delete m_ptrFrameCurrent;
+	delete m_ptrFrameFuture;
+}
+
 int32_t Mpeg1VideoDecoder::getPts(const int32_t frameTimeMillis) {
 	return m_stream.getPts(frameTimeMillis);
 }

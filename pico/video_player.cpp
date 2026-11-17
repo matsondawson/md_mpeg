@@ -729,12 +729,8 @@ namespace {
 		} catch (const std::exception &ex) {
 			printf("Decoder error: %s\n", ex.what());
 		}
+		// The decoder's frames are freed with it on return, so core 1 must have finished reading them
 		waitForScan();
-
-		// The decoder doesn't free these, and each loop makes a new decoder
-		delete videoDecoder->m_ptrFramePast;
-		delete videoDecoder->m_ptrFrameCurrent;
-		delete videoDecoder->m_ptrFrameFuture;
 		return result;
 	}
 }

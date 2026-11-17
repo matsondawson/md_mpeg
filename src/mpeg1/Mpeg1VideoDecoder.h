@@ -129,6 +129,10 @@ public:
 
 public:
 	Mpeg1VideoDecoder();
+	// Frees the three frames; m_ptrRenderFrame only ever points at one of them
+	~Mpeg1VideoDecoder() override;
+	Mpeg1VideoDecoder(const Mpeg1VideoDecoder &) = delete;
+	Mpeg1VideoDecoder &operator=(const Mpeg1VideoDecoder &) = delete;
 
 public:
 	// IWriteByteStream
