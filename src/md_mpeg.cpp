@@ -17,15 +17,30 @@
 #include "mpeg1/Mpeg1VideoDecoder.h"
 #include "mpeg1/AudioDecoders.h"
 #include "sdl2/screenContext.h"
+#if MD_MPEG_ENABLE_MPEG2
+#include "DvdPlayer.h"
+#include "dvd/Disc.h"
+#endif
 
 int main(int argc, char *argv[]) {
 	if (argc < 2) {
-		std::cerr << "Usage: " << argv[0] << " video.mpg\n";
+		std::cerr << "Usage: " << argv[0] << " video.mpg|VIDEO_TS folder\n";
 		return 1;
 	}
 
 	ScreenContextRgbSDL sdl;
 	sdl.setTitle(std::filesystem::path(argv[1]).filename().string() + " - md_mpeg");
+#if MD_MPEG_ENABLE_MPEG2
+	// A DVD-Video folder plays from its menus
+	if (Dvd::Disc::isDvd(argv[1])) {
+		try {
+			return playDvd(sdl, argv[1]);
+		} catch (const std::exception &ex) {
+			std::cout << ex.what() << std::endl;
+			return 1;
+		}
+	}
+#endif
 	uint32_t screenWidth = 0;
 	uint32_t screenHeight = 0;
 	double screenAspect = 0;

@@ -31,6 +31,12 @@ add_library(md_mpeg_core STATIC
 	"src/mpeg1/Mpeg2Video.cpp"
 	"src/mpeg1/Mpeg1AudioDecoder.cpp"
 	"src/mpeg1/A52AudioDecoder.cpp"
+	"src/dvd/Ifo.cpp"
+	"src/dvd/Disc.cpp"
+	"src/dvd/Navigator.cpp"
+	"src/dvd/SubPicture.cpp"
+	"src/dvd/NavPack.cpp"
+	"src/dvd/Overlay.cpp"
 )
 target_include_directories(md_mpeg_core PUBLIC
 	"${CMAKE_SOURCE_DIR}/src"
@@ -53,6 +59,7 @@ add_executable(md_mpeg
 	"src/md_mpeg.cpp"
 	"src/sdl2/screenContext.cpp"
 	"src/sdl2/ControlBar.cpp"
+	"src/DvdPlayer.cpp"
 )
 target_compile_options(md_mpeg PRIVATE ${MD_MPEG_COMPILE_OPTIONS})
 target_link_libraries(md_mpeg PRIVATE md_mpeg_core SDL3::SDL3)

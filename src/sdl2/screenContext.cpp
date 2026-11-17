@@ -79,6 +79,7 @@ void ScreenContextRgbSDL::blitSurface() {
 		width = static_cast<int>(winSurface->h * aspect + 0.5);
 	}
 	const SDL_Rect rect = {(winSurface->w - width) / 2, (winSurface->h - height) / 2, width, height};
+	m_pictureRect = rect;
 	sdlError(SDL_StretchSurface(m_renderSurface, nullptr, winSurface, &rect, SDL_SCALEMODE_LINEAR));
 
 	m_controlBar.setScale(SDL_GetWindowDisplayScale(m_window));
@@ -298,6 +299,16 @@ void ScreenContextRgbSDL::clear() const {
 	SDL_FillSurfaceRect(winSurface, nullptr, SDL_MapRGBA(format, nullptr, 0, 0, 0, 255));
 }
 
+bool ScreenContextRgbSDL::pictureCoordinates(const float windowX, const float windowY, int &x, int &y) const {
+	if (m_pictureRect.w <= 0 || m_pictureRect.h <= 0 || windowX < m_pictureRect.x || windowY < m_pictureRect.y
+	    || windowX >= m_pictureRect.x + m_pictureRect.w || windowY >= m_pictureRect.y + m_pictureRect.h) {
+		return false;
+	}
+	x = static_cast<int>((windowX - m_pictureRect.x) * m_width / m_pictureRect.w);
+	y = static_cast<int>((windowY - m_pictureRect.y) * m_height / m_pictureRect.h);
+	return true;
+}
+
 InputEvents ScreenContextRgbSDL::eventLoop() {
 	InputEvents input;
 	SDL_Event event;
@@ -307,6 +318,9 @@ InputEvents ScreenContextRgbSDL::eventLoop() {
 		switch (event.type) {
 			case SDL_EVENT_MOUSE_MOTION:
 				m_controlBar.mouseMoved(event.motion.x * density, event.motion.y * density);
+				if (pictureCoordinates(event.motion.x * density, event.motion.y * density, input.mouseX, input.mouseY)) {
+					input.mouseMoved = true;
+				}
 				break;
 			case SDL_EVENT_WINDOW_MOUSE_LEAVE:
 				m_controlBar.mouseLeft();
@@ -324,6 +338,9 @@ InputEvents ScreenContextRgbSDL::eventLoop() {
 							input.seekFraction = fraction;
 							break;
 						default:
+							if (pictureCoordinates(event.button.x * density, event.button.y * density, input.mouseX, input.mouseY)) {
+								input.mouseClicked = true;
+							}
 							break;
 					}
 				}
@@ -345,15 +362,35 @@ InputEvents ScreenContextRgbSDL::eventLoop() {
 						break;
 					case SDLK_LEFT:
 						input.seekSeconds -= 10;
+						input.left++;
 						break;
 					case SDLK_RIGHT:
 						input.seekSeconds += 10;
+						input.right++;
 						break;
 					case SDLK_DOWN:
 						input.seekSeconds -= 60;
+						input.down++;
 						break;
 					case SDLK_UP:
 						input.seekSeconds += 60;
+						input.up++;
+						break;
+					case SDLK_RETURN:
+					case SDLK_KP_ENTER:
+						input.activate = true;
+						break;
+					case SDLK_M:
+						input.rootMenu = true;
+						break;
+					case SDLK_T:
+						input.titleMenu = true;
+						break;
+					case SDLK_PAGEDOWN:
+						input.chapterSkip++;
+						break;
+					case SDLK_PAGEUP:
+						input.chapterSkip--;
 						break;
 					case SDLK_ESCAPE:
 					case SDLK_Q:
