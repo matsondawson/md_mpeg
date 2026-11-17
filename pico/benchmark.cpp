@@ -262,11 +262,6 @@ namespace {
 		const auto info = mallinfo();
 		result.heapArena = info.arena;
 		result.heapUsed = info.uordblks;
-
-		// The decoder doesn't free these, and each run makes a new decoder
-		delete videoDecoder->m_ptrFramePast;
-		delete videoDecoder->m_ptrFrameCurrent;
-		delete videoDecoder->m_ptrFrameFuture;
 	}
 
 	// Not inlined: everything from here down is unused, but the caller's frame must not be painted
