@@ -187,6 +187,31 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+### Pre-merge checks
+
+`scripts/check.sh` runs every check in parallel, taking about a minute: the decoder tests built with GCC, with
+Clang, with AddressSanitizer and UndefinedBehaviorSanitizer, with the Pico's decoder options (mono audio,
+MPEG-1 only, no diagnostic messages) and with floating point audio and the full IDCT; the Pico's FAT32 and
+display driver tests; the Pico's Cortex-M0+ assembler run in the unicorn emulator against the decoder's C
+(`tests/asm_check.py`, the same comparison `asm_test` makes on a board); Pico and Pico 2 builds, including one
+for every display module; and a minute of fuzzing. It needs cmake, ninja, g++, clang++, ffmpeg, SDL3, Docker
+and Python's unicorn module (`python-unicorn`). `scripts/check.sh --list` lists the checks, and
+`scripts/check.sh <name>...` runs some of them. The benchmark needs a board, so it doesn't run it.
+
+The decoder tests also check MP2 audio against the ISO/IEC 11172-4 limited accuracy limit, the IDCT against
+the IEEE 1180 (ISO/IEC 23002-1) accuracy limits, and that the sparse IDCT matches the full one exactly.
+
+The fuzz check runs libFuzzer on the demuxer, decoders and DVD information file parser
+(`tests/md_mpeg_fuzz.cpp`) for `FUZZ_SECONDS`, default 60, keeping its corpus in `build/check/fuzz`.
+`tests/fuzz_regressions` holds the smallest input for each bug it has found, which every desktop build
+replays (`md_mpeg_fuzz_replay`).
+
+To run the checks before every push:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Code
 
 - `src/md_mpeg.cpp`: the player (SDL window, audio, input, A/V sync)
@@ -194,7 +219,9 @@ ctest --test-dir build --output-on-failure
   MPEG-2 macroblock layer, `A52AudioDecoder.cpp` the A/52 audio decoder,
   `LpcmAudioDecoder.cpp` the DVD LPCM audio decoder.
 - `src/dvd/`: DVD-Video information files, navigation, sub-pictures and navigation packs; `src/DvdPlayer.cpp` plays them
-- `tests/md_mpeg_tests.cpp`: decoder tests
+- `src/Diagnostics.h`: counters of corrupt and unsupported input, kept by the demuxer and each decoder, and an
+  optional message callback (`MD_MPEG_DIAGNOSTICS`, off on the Pico, where only the counters are compiled)
+- `tests/md_mpeg_tests.cpp`: decoder tests; `tests/md_mpeg_fuzz.cpp`: the fuzz harness
 
 ## Encoding Compatible Files
 

@@ -35,6 +35,22 @@ public:
 #endif
 	}
 
+	// The audio decoders' diagnostics, added up
+	[[nodiscard]] Diagnostics diagnostics() const {
+		Diagnostics total = mpeg.diagnostics();
+#if MD_MPEG_ENABLE_MPEG2
+		total.add(a52.diagnostics());
+#endif
+		return total;
+	}
+
+	void setDiagnosticCallback(const DiagnosticCallback callback, void *const context) {
+		mpeg.diagnostics().setCallback(callback, context);
+#if MD_MPEG_ENABLE_MPEG2
+		a52.diagnostics().setCallback(callback, context);
+#endif
+	}
+
 	// PTS of the first decoded audio frame, -1 until known
 	[[nodiscard]] int32_t firstFramePtsMillis() const {
 #if MD_MPEG_ENABLE_MPEG2

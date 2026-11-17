@@ -1,4 +1,4 @@
-﻿#include "md_mpeg.h"
+#include "md_mpeg.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <thread>
 
+#include "DiagnosticPrinter.h"
 #include "DisplayTimestamper.h"
 #include "PlaybackClock.h"
 #include "Time.h"
@@ -68,6 +69,7 @@ int main(int argc, char *argv[]) {
 	mps.setVideoDecoder(&videoDecoder);
 	AudioDecoders audioDecoder;
 	audioDecoder.attach(mps);
+	printDiagnostics(mps, videoDecoder, audioDecoder);
 	const AudioOutputCloser audioCloser(sdl);
 	mps.buildTimeline(fs);
 

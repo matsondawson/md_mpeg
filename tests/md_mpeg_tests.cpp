@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -24,6 +25,7 @@
 #include "mpeg1/MpegProgramStream.h"
 #include "mpeg1/Mpeg1VideoDecoder.h"
 #include "mpeg1/AudioDecoders.h"
+#include "mpeg1/VideoInternal.h"
 #if MD_MPEG_ENABLE_MPEG2
 #include "dvd/IntroSkipper.h"
 #include "dvd/Navigator.h"
@@ -87,6 +89,9 @@ static fs::path writeFile(const std::string &name, const std::vector<uint8_t> &d
 	return path;
 }
 
+// video_idct's output on testIdctAccuracy's blocks; changes only if the IDCT's arithmetic does
+static constexpr uint64_t IDCT_OUTPUT_HASH = 0x27ca6aa946670e95;
+
 static const std::string VIDEO_320 = "-f lavfi -i testsrc=size=320x240:rate=25";
 static const std::string TONE = "-f lavfi -i sine=frequency=440:sample_rate=44100";
 
@@ -148,6 +153,14 @@ struct Pipeline {
 				audioValues++;
 			}
 		});
+	}
+
+	// Everything the demuxer and decoders reported
+	[[nodiscard]] Diagnostics diagnostics() const {
+		Diagnostics total = demux.diagnostics();
+		total.add(video.diagnostics());
+		total.add(audio.diagnostics());
+		return total;
 	}
 
 	[[nodiscard]] double audioSeconds() const {
@@ -354,6 +367,190 @@ static void testAudioAccuracy() {
 	checkAudioMatchesFfmpeg(stereo, "stereo.pcm", 2);
 }
 
+// MP2 against the ISO/IEC 11172-4 compliance limits, with ffmpeg's floating point decode as the reference: limited
+// accuracy, RMS error below 2^-11/sqrt(12) of full scale. Full accuracy (RMS below 2^-15/sqrt(12), no sample more
+// than 2^-14 out) isn't met, by the floating point build either: both are about 8e-5 RMS from ffmpeg. Mono output
+// (mixed from stereo) is compared with the mean of the two channels.
+static void checkMp2Compliance(const fs::path &clip, const std::string &referenceName, const uint32_t channels) {
+	const auto reference = media(referenceName);
+	if (!fs::exists(reference)) {
+		run("ffmpeg -nostdin -y -i \"" + clip.string() + "\" -vn -f f32le -acodec pcm_f32le \"" + reference.string() + "\"");
+	}
+	const auto bytes = readFile(reference);
+	const auto p = decode(clip);
+	CHECK(p->finished);
+	const bool mixed = MD_MPEG_AUDIO_MONO && channels == 2;
+	const auto referenceSample = [&bytes](const size_t i) {
+		float value;
+		std::memcpy(&value, &bytes[i * 4], 4);
+		return static_cast<double>(value);
+	};
+	const size_t step = mixed ? 2 : 1;
+	const size_t count = std::min(p->audioSamples.size() - p->audioSamples.size() % 64, bytes.size() / 4 / step);
+	CHECK(count > 10000);
+	const double toUnit = MD_MPEG_AUDIO_FIXED_POINT ? 1.0 / 32768.0 : 1.0;
+	double sumError = 0, maxError = 0;
+	for (size_t i = 0; i < count; i++) {
+		size_t decodedIndex = i;
+		if (channels == 2 && !mixed) {
+			const size_t frame = i / 2;
+			decodedIndex = frame / 32 * 64 + (i & 1) * 32 + frame % 32;
+		}
+		const double decoded = p->audioSamples[decodedIndex] * toUnit;
+		const double expected = mixed ? (referenceSample(2 * i) + referenceSample(2 * i + 1)) / 2 : referenceSample(i);
+		const double error = decoded - expected;
+		sumError += error * error;
+		maxError = std::max(maxError, std::abs(error));
+	}
+	const double rms = std::sqrt(sumError / static_cast<double>(std::max<size_t>(count, 1)));
+	std::cout << "  " << referenceName << ": RMS error " << rms << ", max " << maxError << std::endl;
+	CHECK(rms < std::ldexp(1.0, -11) / std::sqrt(12.0));
+}
+
+static void testMp2Compliance() {
+	checkMp2Compliance(generate("tone.mpg", TONE + " -t 3 -c:a mp2"), "tone.f32", 1);
+	const auto stereo = generate("stereo.mpg", "-f lavfi -i \"aevalsrc=0.9*sin(2*PI*(200+2000*t)*t)|0.9*random(0)-0.45:s=48000\""
+	                                           " -t 3 -c:a mp2 -b:a 384k");
+	checkMp2Compliance(stereo, "stereo.f32", 2);
+}
+
+// The IDCT on the IEEE 1180-1990 (now ISO/IEC 23002-1) test: random blocks in three ranges and their negations,
+// forward transformed in double precision, compared with the double precision inverse, must meet its limits.
+// The output hash checks the sparse shortcuts (MD_MPEG_SPARSE_IDCT) give exactly the full IDCT's result, and that
+// the IDCT's arithmetic hasn't changed: pico/idct_m0.S must stay bit-exact with it (pico/asm_test.cpp checks).
+static void testIdctAccuracy() {
+	double cosines[8][8];
+	for (int u = 0; u < 8; u++) {
+		for (int x = 0; x < 8; x++) {
+			cosines[u][x] = (u ? 0.5 : std::sqrt(0.125)) * std::cos((2 * x + 1) * u * M_PI / 16);
+		}
+	}
+	struct Range {
+		int low, high, sign;
+	};
+	const Range ranges[] = {{256, 255, 1}, {5, 5, 1}, {300, 300, 1}, {256, 255, -1}, {5, 5, -1}, {300, 300, -1}};
+	// IEEE 1180's limits
+	constexpr int MAX_PPE = 1;
+	constexpr double MAX_PMSE = 0.06, MAX_OMSE = 0.02, MAX_PME = 0.015, MAX_OME = 0.0015;
+	uint64_t hash = 14695981039346656037ull;
+	for (const auto &range : ranges) {
+		// IEEE 1180's generator
+		int64_t randx = 1;
+		const auto random = [&randx](const int low, const int high) {
+			randx = (randx * 1103515245 + 12345) & 0xffffffff;
+			const double x = static_cast<double>(randx & 0x7ffffffe) / 0x7fffffff * (low + high + 1);
+			return static_cast<int>(x) - low;
+		};
+		constexpr int BLOCKS = 10000;
+		double squareError[64] = {}, error[64] = {};
+		int ppe = 0;
+		for (int n = 0; n < BLOCKS; n++) {
+			double samples[64];
+			for (double &sample : samples) {
+				sample = range.sign * random(range.low, range.high);
+			}
+			int32_t coefficients[64];
+			for (int u = 0; u < 8; u++) {
+				for (int v = 0; v < 8; v++) {
+					double sum = 0;
+					for (int y = 0; y < 8; y++) {
+						for (int x = 0; x < 8; x++) {
+							sum += cosines[u][y] * cosines[v][x] * samples[y * 8 + x];
+						}
+					}
+					coefficients[u * 8 + v] = std::clamp(static_cast<int32_t>(std::lround(sum)), -2048, 2047);
+				}
+			}
+			int32_t block[64];
+			for (int i = 0; i < 64; i++) {
+				block[i] = videoPremultiply(coefficients[i], static_cast<uint32_t>(i));
+			}
+			video_idct(block);
+			for (int y = 0; y < 8; y++) {
+				for (int x = 0; x < 8; x++) {
+					double sum = 0;
+					for (int u = 0; u < 8; u++) {
+						for (int v = 0; v < 8; v++) {
+							sum += cosines[u][y] * cosines[v][x] * coefficients[u * 8 + v];
+						}
+					}
+					const int i = y * 8 + x;
+					const int expected = std::clamp(static_cast<int>(std::lround(sum)), -256, 255);
+					const int actual = std::clamp(block[i], -256, 255);
+					const int e = actual - expected;
+					ppe = std::max(ppe, std::abs(e));
+					squareError[i] += e * e;
+					error[i] += e;
+					hash = (hash ^ static_cast<uint32_t>(block[i])) * 1099511628211ull;
+				}
+			}
+		}
+		double pmse = 0, omse = 0, pme = 0, ome = 0;
+		for (int i = 0; i < 64; i++) {
+			pmse = std::max(pmse, squareError[i] / BLOCKS);
+			pme = std::max(pme, std::abs(error[i] / BLOCKS));
+			omse += squareError[i];
+			ome += error[i];
+		}
+		omse /= 64.0 * BLOCKS;
+		ome = std::abs(ome / (64.0 * BLOCKS));
+		std::cout << "  range -" << range.low << ".." << range.high << (range.sign < 0 ? " negated" : "") << ": ppe " << ppe
+			<< ", pmse " << pmse << ", omse " << omse << ", pme " << pme << ", ome " << ome << std::endl;
+		CHECK(ppe <= MAX_PPE);
+		CHECK(pmse <= MAX_PMSE);
+		CHECK(omse <= MAX_OMSE);
+		CHECK(pme <= MAX_PME);
+		CHECK(ome <= MAX_OME);
+	}
+	std::cout << "  output hash " << std::hex << hash << std::dec << std::endl;
+	CHECK(hash == IDCT_OUTPUT_HASH);
+
+	// Intra DC values are premultiplied by a shift
+	CHECK(VIDEO_PREMULTIPLIER_MATRIX[0] == 1 << (VIDEO_DC_PREMULTIPLY_SHIFT + 8));
+
+	int32_t zeros[64] = {};
+	video_idct(zeros);
+	CHECK(std::all_of(std::begin(zeros), std::end(zeros), [](const int32_t v) { return v == 0; }));
+}
+
+// The decoder only checks MPEG-1 motion vectors against the luma plane: wherever the luma prediction is inside the
+// picture, the chroma one (the vector halved, truncated) must be inside the chroma plane, for every position and
+// vector that could reach the edges. Also checks the luma bounds themselves at the corners.
+static void testMotionVectorRange() {
+	uint64_t inRange = 0, failures = 0;
+	for (uint32_t width = 1; width <= 4; width++) {
+		for (uint32_t height = 1; height <= 3; height++) {
+			for (uint32_t row = 0; row < height; row++) {
+				for (uint32_t col = 0; col < width; col++) {
+					for (int32_t h = -2 * 16 * 4 - 4; h <= 2 * 16 * 4 + 4; h++) {
+						for (int32_t v = -2 * 16 * 3 - 4; v <= 2 * 16 * 3 + 4; v++) {
+							if (!videoMotionInRange(col, row, width, height, h, v)) {
+								continue;
+							}
+							inRange++;
+							if (!videoMotionInRange(col, row, width, height, h / 2, v / 2, 8)) {
+								failures++;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	CHECK(inRange > 100000);
+	CHECK(failures == 0);
+	// One macroblock picture: only the zero vector fits; half pel needs a pixel beyond the edge
+	CHECK(videoMotionInRange(0, 0, 1, 1, 0, 0));
+	CHECK(!videoMotionInRange(0, 0, 1, 1, 1, 0));
+	CHECK(!videoMotionInRange(0, 0, 1, 1, 0, 1));
+	CHECK(!videoMotionInRange(0, 0, 1, 1, -1, 0));
+	// Two wide: right by up to 16 whole pixels, or 15.5
+	CHECK(videoMotionInRange(0, 0, 2, 1, 32, 0));
+	CHECK(videoMotionInRange(0, 0, 2, 1, 31, 0));
+	CHECK(!videoMotionInRange(0, 0, 2, 1, 33, 0));
+	CHECK(!videoMotionInRange(2, 0, 2, 1, 0, 0));
+}
+
 // Extension and user data after sequence, group and picture headers must be skipped, without being reported as
 // corruption. Fed straight to the video decoder, as this needs an elementary stream edited at start codes.
 static void testExtensionAndUserData() {
@@ -403,15 +600,13 @@ static void testExtensionAndUserData() {
 	const auto video = std::make_unique<Mpeg1VideoDecoder>();
 	int frames = 0;
 	video->setFrameCallback([&frames](const Frame &) { frames++; });
-	std::ostringstream log;
-	auto *const coutBuffer = std::cout.rdbuf(log.rdbuf());
 	for (const auto byte : edited) {
 		video->writeByte(byte);
 	}
 	video->flush();
-	std::cout.rdbuf(coutBuffer);
 	CHECK(frames == 50);
-	CHECK(log.str().empty());
+	// Nothing reported as corrupt
+	CHECK(video->diagnostics().total() == 0);
 }
 
 // Only MP2 is supported; other audio is ignored rather than decoded as noise
@@ -445,6 +640,9 @@ static void testCorrupt() {
 	CHECK(!p->threw);
 	CHECK_RANGE(p->frames, 20, 100);
 	CHECK(p->audioSeconds() > 2.0);
+	// The damage is counted, and a clean decode reports none
+	CHECK(p->diagnostics().total() > 0);
+	CHECK(decode(generate("bframes.mpg", ""))->diagnostics().total() == 0);
 }
 
 // Two files joined: PTS restart in the middle, the timeline must stay continuous
@@ -613,7 +811,10 @@ static std::vector<std::vector<uint8_t>> decodeYuv(const fs::path &path, bool &m
 }
 
 // Every picture must match ffmpeg's decode. The IDCTs differ, and the difference builds up through predicted
-// pictures, so this is a PSNR floor rather than exact equality.
+// pictures, so this is a PSNR floor rather than exact equality. The mean is about 64 to 74 dB with the IEEE 1180
+// accurate IDCT, and was 58 to 62 dB before it, so the mean floor catches a less accurate IDCT.
+static constexpr double MIN_MEAN_PSNR_DB = 63.0;
+
 static void checkVideoMatchesFfmpeg(const fs::path &clip, const int expectedFrames, const bool expectMpeg2,
                                     const double minPsnrDb = 40.0) {
 	if (!fs::exists(clip)) {
@@ -655,6 +856,7 @@ static void checkVideoMatchesFfmpeg(const fs::path &clip, const int expectedFram
 	std::cout << "  " << clip.filename().string() << ": " << compared << " pictures, PSNR from ffmpeg min " << minPsnr
 		<< " dB (picture " << minPsnrIndex << "), mean " << sumPsnr / static_cast<double>(compared) << " dB" << std::endl;
 	CHECK(minPsnr >= minPsnrDb);
+	CHECK(sumPsnr / static_cast<double>(compared) >= MIN_MEAN_PSNR_DB);
 }
 
 static const std::string VIDEO_MOVING = "-f lavfi -i testsrc2=size=352x288:rate=25";
@@ -954,6 +1156,7 @@ static void testA52Corrupt() {
 	const auto p = decode(writeFile("a52corrupt.vob", data));
 	CHECK(p->finished);
 	CHECK(!p->threw);
+	CHECK(p->diagnostics()[Diagnostic::CorruptAudio] + p->diagnostics()[Diagnostic::AudioBytesSkipped] > 0);
 	CHECK(p->audioSeconds() > 15.0);
 }
 
@@ -1443,6 +1646,9 @@ int main(int argc, char *argv[]) {
 		{"video only", testVideoOnly},
 		{"extension and user data", testExtensionAndUserData},
 		{"audio accuracy", testAudioAccuracy},
+		{"mp2 11172-4 compliance", testMp2Compliance},
+		{"idct accuracy", testIdctAccuracy},
+		{"motion vector range", testMotionVectorRange},
 		{"unsupported audio", testUnsupportedAudio},
 		{"size change", testSizeChange},
 		{"truncated", testTruncated},

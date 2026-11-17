@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../common.h"
+#include "../Diagnostics.h"
 #include "../stream/MStream.h"
 #include "../stream/RingBufferWithStartCodeEvent.h"
 #include "../stream/ReadBitStream.h"
@@ -153,6 +154,14 @@ public:
 	[[nodiscard]] uint32_t lastStartCode() const;
 
 	void setFrameCallback(const std::function<void(const Frame &frame)> &frameCallback);
+
+	// Corrupt and unsupported input this has met
+	Diagnostics &diagnostics() { return m_diagnostics; }
+	[[nodiscard]] const Diagnostics &diagnostics() const { return m_diagnostics; }
+
+	// Mutable: prediction, which is const, reports bad motion vectors
+	mutable Diagnostics m_diagnostics;
+
 
 	void decodeSequence();
 	// Derives the frame and macroblock sizes and frame rate once the sequence header and its extensions are read

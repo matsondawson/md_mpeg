@@ -256,7 +256,7 @@ namespace {
 	// Writes an 8x8 block of samples: replacing what is there (intra), or added to the prediction
 	void storeBlock(uint8_t *d, const uint32_t stride, int32_t *block, const bool intra, const bool dcOnly) {
 		if (dcOnly) {
-			const int32_t value = (block[0] + 128) >> 8;
+			const int32_t value = videoDcValue(block[0]);
 			block[0] = 0;
 			for (int y = 0; y < 8; y++, d += stride) {
 				for (int x = 0; x < 8; x++) {
@@ -337,6 +337,10 @@ void Mpeg1VideoDecoder::decodePictureCodingExtension() {
 }
 
 void Mpeg1VideoDecoder::processSliceMpeg2(const uint32_t slice) {
+	if (m_macroblockWidth == 0) {
+		// No sequence header yet
+		throw std::runtime_error("Slice before a sequence header");
+	}
 	const uint32_t mbRows = m_pictureStructure == FRAME_PICTURE ? m_macroblockHeight : m_macroblockHeight / 2;
 	if (slice == 0 || slice > mbRows) {
 		throw std::runtime_error("Slice position out of range");
@@ -475,6 +479,7 @@ void Mpeg1VideoDecoder::processMacroblockMpeg2(const bool slice_begin, const uin
 
 int32_t Mpeg1VideoDecoder::decodeMotionComponent(const uint32_t fCode, const int32_t prediction) {
 	if (fCode == 0 || fCode > 9) {
+		m_diagnostics.count(Diagnostic::InvalidHeader);
 		throw std::runtime_error("Invalid f_code");
 	}
 	return updateMotionVector(static_cast<int32_t>(fCode) - 1, prediction);
@@ -693,7 +698,7 @@ void Mpeg1VideoDecoder::decodeBlocksMpeg2(uint32_t cbp) {
 			if (position == 63) {
 				last = value;
 			}
-			block_data[position] = value * VIDEO_PREMULTIPLIER_MATRIX[position];
+			block_data[position] = videoPremultiply(value, position);
 		};
 
 		if (macroblock_intra) {
@@ -705,9 +710,9 @@ void Mpeg1VideoDecoder::decodeBlocksMpeg2(uint32_t cbp) {
 				dc += differential & (1 << (dctDcSize - 1)) ? differential : -(1 << dctDcSize) | (differential + 1);
 			}
 			dc_predictor[plane] = dc;
-			// intra_dc_mult is 8 >> intra_dc_precision, and the IDCT wants it premultiplied by 32
+			// intra_dc_mult is 8 >> intra_dc_precision, then premultiplied for the IDCT
 			sum = dc << (3 - m_intraDcPrecision);
-			block_data[0] = sum << 5;
+			block_data[0] = sum << VIDEO_DC_PREMULTIPLY_SHIFT;
 			n = 1;
 			quantMatrix = intra_quant_matrix;
 
@@ -759,10 +764,10 @@ void Mpeg1VideoDecoder::decodeBlocksMpeg2(uint32_t cbp) {
 		}
 
 		// Mismatch control: make the sum odd by toggling the last coefficient's lowest bit. For a block with
-		// only a first (DC) coefficient the toggle is skipped: at +-1 x 2 premultiplied, it rounds away in this IDCT.
+		// only a first (DC) coefficient the toggle is skipped: +-1 at (7, 7) is far too small to change any sample.
 		const bool dcOnly = n == 1;
 		if (!dcOnly && !(sum & 1)) {
-			block_data[63] = (last ^ 1) * VIDEO_PREMULTIPLIER_MATRIX[63];
+			block_data[63] = videoPremultiply(last ^ 1, 63);
 		}
 
 		uint8_t *d;

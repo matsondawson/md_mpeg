@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs the pre-merge checks before every push. Enable with: git config core.hooksPath .githooks
+# Skip once with: git push --no-verify
+set -uo pipefail
+root=$(git rev-parse --show-toplevel)
+
+# Nothing to check when only deleting remote branches
+pushing=0
+while read -r _ local_sha _ _; do
+	[ "$local_sha" != 0000000000000000000000000000000000000000 ] && pushing=1
+done
+[ $pushing = 1 ] || exit 0
+
+if [ -n "$(git -C "$root" status --porcelain --untracked-files=no)" ]; then
+	echo "pre-push: warning, uncommitted changes; the checks test the working tree, not the pushed commits" >&2
+fi
+echo "pre-push: running scripts/check.sh (git push --no-verify skips it)" >&2
+exec "$root/scripts/check.sh" < /dev/null

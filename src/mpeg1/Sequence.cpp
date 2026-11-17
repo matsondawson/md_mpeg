@@ -1,6 +1,7 @@
 // Portions adapted from PL_MPEG (MIT, Copyright (c) 2019 Dominic Szablewski), see THIRD_PARTY_NOTICES.md
 
 #include <cstring>
+#include <stdexcept>
 
 #include "Mpeg1VideoDecoder.h"
 
@@ -63,8 +64,15 @@ static const uint8_t VIDEO_INTRA_QUANT_MATRIX[] = {
 
 
 void Mpeg1VideoDecoder::decodeSequence() {
-	m_width = m_bitStream.pull(12);
-	m_height = m_bitStream.pull(12);
+	const uint32_t width = m_bitStream.pull(12);
+	const uint32_t height = m_bitStream.pull(12);
+	if (width == 0 || height == 0) {
+		// Forbidden, and the macroblock arithmetic divides by the width
+		m_diagnostics.count(Diagnostic::InvalidHeader);
+		throw std::runtime_error("Invalid picture size");
+	}
+	m_width = width;
+	m_height = height;
 	aspect_ratio_enum = m_bitStream.pull(4);
 	aspect_ratio = ASPECT_RATIOS[aspect_ratio_enum];
 	frame_rate_enum = m_bitStream.pull(4);

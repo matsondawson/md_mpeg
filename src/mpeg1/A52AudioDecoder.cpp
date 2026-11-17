@@ -1301,7 +1301,7 @@ uint32_t A52AudioDecoder::validHeaderFrameBytes() {
 	if ((m_stream.peekAt(5) >> 3) > 8) {
 		if (m_outputChannels == 0 && ++m_unsupportedHeaderCount == 3) {
 			m_audioDisabled = true;
-			std::cout << "Unsupported A/52 audio version. Audio disabled." << std::endl;
+			MD_MPEG_REPORT(m_diagnostics, Diagnostic::UnsupportedAudio, 1, "Unsupported A/52 audio version. Audio disabled.");
 		}
 		return 0;
 	}
@@ -1325,7 +1325,7 @@ void A52AudioDecoder::decodeHeader() {
 		return;
 	}
 	if (m_resyncSkippedBytes && !m_expectResync) {
-		std::cout << "Corrupt audio, skipped " << m_resyncSkippedBytes << " bytes" << std::endl;
+		MD_MPEG_REPORT(m_diagnostics, Diagnostic::AudioBytesSkipped, m_resyncSkippedBytes, "Corrupt audio, skipped bytes");
 	}
 	m_resyncSkippedBytes = 0;
 	m_expectResync = false;
@@ -1391,7 +1391,7 @@ bool A52AudioDecoder::decodeBufferedFrame() {
 		m_decoder->decodeFrame(m_frameBytes, m_outputChannels, block);
 	} catch (const FrameError &) {
 		// Keeps the timing: the rest of the frame is silent
-		std::cout << "Corrupt audio frame, muting it" << std::endl;
+		MD_MPEG_REPORT(m_diagnostics, Diagnostic::CorruptAudio, 1, "Corrupt audio frame, muting it");
 		std::fill(m_decoder->left + block * BLOCK_SAMPLES, m_decoder->left + SAMPLES_PER_FRAME, 0.0f);
 		std::fill(m_decoder->right + block * BLOCK_SAMPLES, m_decoder->right + SAMPLES_PER_FRAME, 0.0f);
 		std::memset(m_decoder->delay, 0, sizeof(m_decoder->delay));

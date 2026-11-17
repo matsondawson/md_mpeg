@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../common.h"
+#include "../Diagnostics.h"
 #include "AudioSample.h"
 #include "../stream/MStream.h"
 #include "../stream/RingBufferTyped.h"
@@ -42,6 +43,7 @@ class Mpeg1AudioDecoder final : public MStream::IWriteByteStream
 private:
 	std::function<void(uint32_t frequency, uint32_t channels, AudioSampleBuffer* soundBuffer)> m_frameCallback;
 	int m_decoderState;
+	Diagnostics m_diagnostics;
 
 	AudioSampleBuffer m_soundBuffer;
 
@@ -114,6 +116,11 @@ public:
 
 public:
 	void setFrameCallback(const std::function<void(uint32_t frequency, uint32_t channels, AudioSampleBuffer* soundBuffer)> &);
+
+	// Corrupt and unsupported input this has met
+	Diagnostics &diagnostics() { return m_diagnostics; }
+	[[nodiscard]] const Diagnostics &diagnostics() const { return m_diagnostics; }
+
 
 	// Samples per channel in one MPEG-1 layer II frame
 	static constexpr uint32_t SAMPLES_PER_FRAME = 1152;

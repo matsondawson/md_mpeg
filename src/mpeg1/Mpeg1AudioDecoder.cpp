@@ -384,7 +384,7 @@ void Mpeg1AudioDecoder::decode() {
                 decodeFrame();
             } catch (const MStream::EndOfData &) {
                 // Corrupt frame data read past the end of the frame
-                std::cout << "Corrupt audio frame, skipping" << std::endl;
+                MD_MPEG_REPORT(m_diagnostics, Diagnostic::CorruptAudio, 1, "Corrupt audio frame, skipping");
                 resync();
             }
             break;
@@ -481,7 +481,8 @@ void Mpeg1AudioDecoder::noteUnsupportedHeader(const uint32_t header) {
     m_unsupportedFrameEnd = m_searchPosition + frameBytes;
     if (m_unsupportedFrameRun == 3) {
         m_audioDisabled = true;
-        std::cout << "Unsupported audio format, only MPEG-1 Layer II is supported. Audio disabled." << std::endl;
+        MD_MPEG_REPORT(m_diagnostics, Diagnostic::UnsupportedAudio, 1,
+                       "Unsupported audio format, only MPEG-1 Layer II is supported. Audio disabled.");
     }
 }
 
@@ -526,7 +527,7 @@ void Mpeg1AudioDecoder::decodeHeader() {
         return;
     }
     if (m_resyncSkippedBytes && !m_expectResync) {
-        std::cout << "Corrupt audio, skipped " << m_resyncSkippedBytes << " bytes" << std::endl;
+        MD_MPEG_REPORT(m_diagnostics, Diagnostic::AudioBytesSkipped, m_resyncSkippedBytes, "Corrupt audio, skipped bytes");
     }
     m_resyncSkippedBytes = 0;
     m_expectResync = false;

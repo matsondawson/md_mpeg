@@ -9,6 +9,9 @@
 // bit 2j + 1 if it has any coefficient. Columns with nothing below their first coefficient skip the
 // arithmetic, and so do rows when only the first column has coefficients.
 //
+// Like video_idct(), it rounds by adding VIDEO_IDCT_ROUNDING (256) to the first coefficient, which every output
+// includes once, so the rows only shift by VIDEO_IDCT_SHIFT (9). The first column always has a coefficient then.
+//
 // GCC turns the multiplies into shifts and adds, but the RP2040's multiplier takes one cycle, and the M0+'s
 // eight low registers are too few for GCC to keep a transform's values in them. In RAM, so the flash cache
 // doesn't hold it up.
@@ -75,8 +78,8 @@
 	.endm
 
 	// The even half, from the coefficients at offsets p0, p2, p4, p6 from r0. Leaves y3 in r2, y5 in r3,
-	// y6 in r4 and y4 in r7. With round set, adds 128 to m0, which every output includes once.
-	.macro EVEN p0, p2, p4, p6, round
+	// y6 in r4 and y4 in r7.
+	.macro EVEN p0, p2, p4, p6
 	ldr r1, [r0, #\p2]
 	.if \p6 > 124
 	adds r0, #128
@@ -95,9 +98,6 @@
 	asrs r7, r7, #8
 	subs r7, r7, r1          // x2
 	ldr r4, [r0, #\p0]
-	.if \round
-	adds r4, #128
-	.endif
 	subs r3, r4, r2          // x1 = m0 - b1
 	adds r4, r4, r2          // x3 = m0 + b1
 	adds r2, r3, r7          // y3 = x1 + x2
@@ -128,7 +128,7 @@
 
 	// Shifts a rounded row output down and stores it at offset off from r0
 	.macro EMIT reg, off, tmp, add
-	asrs \reg, \reg, #8
+	asrs \reg, \reg, #9
 	STORE \reg, r0, \off, \tmp, \add
 	.endm
 
@@ -146,6 +146,13 @@
 	mov r7, r11
 	push {r4, r5, r6, r7}
 	sub sp, #FRAME
+	// The rounding, in the first coefficient
+	ldr r4, [r0, #0]
+	adds r4, #128
+	adds r4, #128
+	str r4, [r0, #0]
+	movs r4, #2
+	orrs r3, r4
 	str r3, [sp, #MASK]
 	str r1, [sp, #DEST]
 	str r2, [sp, #STRIDE]
@@ -185,7 +192,7 @@
 
 .Lcolumn_full_\name:
 	ODD 32, 96, 160, 224
-	EVEN 0, 64, 128, 192, 0
+	EVEN 0, 64, 128, 192
 	mov r1, r10              // b7
 	mov r5, r11              // x4
 	mov r6, r12              // x0
@@ -233,8 +240,7 @@
 	ldr r3, [sp, #STRIDE]
 .Lrow_dc_\name:
 	ldr r2, [r0, #0]
-	adds r2, #128
-	asrs r2, r2, #8
+	asrs r2, r2, #9
 	movs r4, #0
 	str r4, [r0, #0]
 	adds r0, #32
@@ -265,7 +271,7 @@
 	// r0 the row, r1 the destination
 	str r1, [sp, #DEST]
 	ODD 4, 12, 20, 28
-	EVEN 0, 8, 16, 24, 1
+	EVEN 0, 8, 16, 24
 	mov r1, r10              // b7
 	mov r10, r0              // the row, while r0 is the destination
 	ldr r0, [sp, #DEST]

@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include "../common.h"
+#include "../Diagnostics.h"
 #include "../MException.h"
 #include "../stream/MStream.h"
 #include "../stream/FileStream.h"
@@ -94,6 +95,7 @@ namespace Mpeg1 {
 
 		uint32_t m_bitCount, m_bitsLeft;
 		int32_t m_streamingPacketBytesRemaining;
+		Diagnostics m_diagnostics;
 
 		bool m_endOfStreamFlushed = false;
 
@@ -229,7 +231,8 @@ namespace Mpeg1 {
 					return DemuxResult::Continue;
 				}
 				if (m_syncSkippedBytes && !m_expectSyncSkip) {
-					std::cout << "Stream corruption, skipped " << m_syncSkippedBytes << " bytes to the next start code" << std::endl;
+					MD_MPEG_REPORT(m_diagnostics, Diagnostic::SyncBytesSkipped, m_syncSkippedBytes,
+					               "Stream corruption, skipped bytes to the next start code");
 				}
 				m_syncSkippedBytes = 0;
 				m_expectSyncSkip = false;
@@ -277,12 +280,25 @@ namespace Mpeg1 {
 					}
 
 					m_buffer.clearMark();
+					if (m_streamingPacketBytesRemaining == 0) {
+						// An empty packet, or a header taking the whole packet: back to scanning for start codes.
+						// Left selected, the stream would wait forever for bytes that aren't coming.
+						m_ptrCurrentDecoderStream = nullptr;
+					}
 				} catch ([[maybe_unused]] const MStream::EndOfData &ex) {
 					// Header not fully buffered: rewind and retry on the next call
 					m_buffer.reset();
 					m_streamingPacketBytesRemaining = m_streamingPacketBytesRemainingMark;
 					// The header may have selected a stream before running out, so parse it again next time
 					m_ptrCurrentDecoderStream = nullptr;
+
+					if (m_buffer.isFull()) {
+						// The header is longer than the whole buffer, so it will never be complete. Real headers are
+						// far shorter, so it's corrupt: drop its start code and scan for the next.
+						m_buffer.nextByte();
+						MD_MPEG_REPORT(m_diagnostics, Diagnostic::CorruptPacket, 1, "Corrupt packet, header too long");
+						return DemuxResult::Continue;
+					}
 
 					if (inputStream.isEmpty()) {
 						// Truncated packet header at the end of the file, discard it
@@ -301,7 +317,7 @@ namespace Mpeg1 {
 					m_buffer.clearMark();
 					m_ptrCurrentDecoderStream = nullptr;
 					m_streamingPacketBytesRemaining = 0;
-					std::cout << "Corrupt packet, skipping: " << ex.what() << std::endl;
+					MD_MPEG_REPORT(m_diagnostics, Diagnostic::CorruptPacket, 1, ex.what());
 					return DemuxResult::Continue;
 				}
 			}
@@ -522,6 +538,10 @@ namespace Mpeg1 {
 			}
 			return m_firstScrMillis >= 0 ? estimateBytePosition(targetMillis + m_firstScrMillis) : -1;
 		}
+
+		// Corrupt and unsupported input this has met
+		Diagnostics &diagnostics() { return m_diagnostics; }
+		[[nodiscard]] const Diagnostics &diagnostics() const { return m_diagnostics; }
 
 		void setVideoDecoder(MStream::IWriteByteStream *decoder) {
 			m_ptrVideoDecoderStream = decoder;
