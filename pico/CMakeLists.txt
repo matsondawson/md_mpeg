@@ -94,6 +94,8 @@ function(add_decoder_app name main_source)
 endfunction()
 
 add_decoder_app(benchmark_flash benchmark.cpp)
+# The benchmark also times converting frames for the screen
+use_display(benchmark_flash)
 option(MD_MPEG_PICO_AUDIO_ON_CORE1 "Decode audio on core 1, between frame scans, instead of on core 0" ON)
 add_decoder_app(video_player video_player.cpp)
 add_decoder_app(video_player_sd video_player.cpp)
