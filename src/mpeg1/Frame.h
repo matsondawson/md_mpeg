@@ -42,6 +42,10 @@ public:
 	float m_aspectRatio = 0;
 	// Fields this frame is displayed for: 2, more with MPEG-2 repeat_first_field
 	uint8_t m_fields = 2;
+	// Its two fields were captured at different times (MPEG-2 progressive_frame 0), so it should be
+	// deinterlaced, and which field is shown first
+	bool m_interlaced = false;
+	bool m_topFieldFirst = true;
 
 	Frame();
 	~Frame();
