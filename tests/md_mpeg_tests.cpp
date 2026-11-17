@@ -24,6 +24,7 @@
 #include "mpeg1/Mpeg1VideoDecoder.h"
 #include "mpeg1/AudioDecoders.h"
 #if MD_MPEG_ENABLE_MPEG2
+#include "dvd/IntroSkipper.h"
 #include "dvd/Navigator.h"
 #include "dvd/SubPicture.h"
 #endif
@@ -1056,6 +1057,108 @@ static void testDvdNavigation() {
 	CHECK(nav.cellNumber() == 1);
 }
 
+// A disc whose First Play shows two warnings before its title menu. Skipping a program chain follows its post
+// command, past its still cells and program chain still.
+static void testDvdSkipProgramChain() {
+	const auto folder = media("dvdintro") / "VIDEO_TS";
+	fs::create_directories(folder);
+
+	IfoBuilder vmg(3);
+	vmg.bytes(0, {'D', 'V', 'D', 'V', 'I', 'D', 'E', 'O', '-', 'V', 'M', 'G'});
+	vmg.u32(0x84, 0x400);
+	vmg.u32(0xC8, 2);
+	vmg.pgc(0x400, {}, {
+		        {0x30, 0x06, 0x00, 0x02, 0x00, 0xC0, 0x00, 0x00}, // to video manager PGC 2
+	        }, {});
+	// Menus: the title menu (PGC 1), then two warnings only reached by links
+	vmg.u16(0x1000, 1);
+	vmg.bytes(0x1008, {'e', 'n'});
+	vmg.u32(0x1008 + 4, 16);
+	vmg.u16(0x1010, 3);
+	vmg.u8(0x1018, 0x82);
+	vmg.u32(0x1018 + 4, 0x30);
+	vmg.u32(0x1020 + 4, 0x200);
+	vmg.u32(0x1028 + 4, 0x400);
+	vmg.pgc(0x1010 + 0x30, {{0, 0, 255}}, {}, {});
+	vmg.pgc(0x1010 + 0x200, {{0, 0, 10}, {1, 1, 255}}, {}, {
+		        {0x30, 0x06, 0x00, 0x03, 0x00, 0xC0, 0x00, 0x00}, // to video manager PGC 3
+	        });
+	vmg.u8(0x1010 + 0x400 + 0xA2, 255); // program chain still
+	vmg.pgc(0x1010 + 0x400, {{2, 2, 0}}, {}, {
+		        {0x30, 0x06, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00}, // to the title menu
+	        });
+	vmg.save(folder / "VIDEO_TS.IFO");
+
+	Dvd::Disc disc(media("dvdintro").string());
+	Dvd::Navigator nav(disc);
+	nav.start();
+	CHECK(nav.domain() == Dvd::Domain::VideoManagerMenu);
+	CHECK(nav.cell() && nav.cell()->firstSector == 0);
+	CHECK(!nav.inMenuEntryPgc());
+	auto jumps = nav.jumpCount();
+	nav.skipProgramChain();
+	CHECK(nav.jumpCount() != jumps);
+	CHECK(nav.cell() && nav.cell()->firstSector == 2);
+	CHECK(!nav.inMenuEntryPgc());
+	nav.skipProgramChain();
+	CHECK(nav.domain() == Dvd::Domain::VideoManagerMenu);
+	CHECK(nav.inMenuEntryPgc());
+	CHECK(nav.cell() && nav.cell()->stillTime == 255);
+	// The menu has no post commands or next program chain: skipping it ends playback, as its end would
+	nav.skipProgramChain();
+	CHECK(nav.stopped());
+}
+
+// Program chains before the first menu: short ones without buttons are skipped, until one with buttons or a long
+// one. Menu entries aren't skipped, and each program chain is judged once.
+static void testDvdIntroSkipper() {
+	Dvd::Pgc warning, logo, menu, feature, menuEntry;
+	warning.playbackTimeMs = 15000;
+	logo.playbackTimeMs = 0;
+	menuEntry.playbackTimeMs = 8000;
+	menu.playbackTimeMs = 30000;
+	feature.playbackTimeMs = Dvd::IntroSkipper::MAX_INTRO_MS;
+
+	Dvd::IntroSkipper skipper(true);
+	CHECK(skipper.shouldSkip(&warning, false, false));
+	CHECK(!skipper.shouldSkip(&warning, false, false)); // judged already
+	CHECK(skipper.shouldSkip(&logo, false, false));
+	CHECK(!skipper.shouldSkip(&menuEntry, true, false)); // an opening before the buttons
+	CHECK(skipper.active());
+	CHECK(!skipper.shouldSkip(&menu, false, true));
+	CHECK(!skipper.active());
+	CHECK(!skipper.shouldSkip(&logo, false, false)); // the first menu has been reached
+
+	Dvd::IntroSkipper noMenu(true);
+	CHECK(noMenu.shouldSkip(&warning, false, false));
+	CHECK(!noMenu.shouldSkip(&feature, false, false));
+	CHECK(!noMenu.active());
+
+	Dvd::IntroSkipper disabled(false);
+	CHECK(!disabled.shouldSkip(&warning, false, false));
+}
+
+// A stream of one picture, like a DVD menu still, must decode after reset() even if the decoder had seen no
+// sequence before: the reset's wait for a keyframe used to end only when a second picture started
+static void testSinglePictureAfterReset() {
+	const auto clip = generate("still.vob", "-f lavfi -i testsrc2=size=720x576:rate=25 -frames:v 1 -c:v mpeg2video", "vob");
+	for (const bool reset: {false, true}) {
+		MStream::FileStreamRead file(clip.c_str());
+		Mpeg1::MpegProgramStream demux;
+		Mpeg1VideoDecoder video;
+		demux.setVideoDecoder(&video);
+		int frames = 0;
+		video.setFrameCallback([&](const Frame &) { frames++; });
+		if (reset) {
+			demux.reset();
+			video.reset();
+		}
+		for (int i = 0; i < 100000 && demux.nextPacket(file) != Mpeg1::DemuxResult::EndOfStream; i++) {
+		}
+		CHECK(frames == 1);
+	}
+}
+
 static void testA52Seek() {
 	const auto clip = generate("a52long.vob", VIDEO_320 + " " + TONE + " -t 20 -c:v mpeg2video -bf 2 -g 12" + A52, "vob");
 	Pipeline p(clip);
@@ -1224,7 +1327,10 @@ int main(int argc, char *argv[]) {
 		{"lpcm chosen stream", testLpcmChosenStream},
 		{"seek across programs", testTimelineSeek},
 		{"dvd sub-picture", testSubPicture},
+		{"single picture after reset", testSinglePictureAfterReset},
 		{"dvd navigation", testDvdNavigation},
+		{"dvd skip program chain", testDvdSkipProgramChain},
+		{"dvd intro skipping", testDvdIntroSkipper},
 #endif
 	};
 	for (const auto &[name, test] : tests) {

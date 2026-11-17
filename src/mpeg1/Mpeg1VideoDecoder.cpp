@@ -69,7 +69,7 @@ void Mpeg1VideoDecoder::reset() {
 #endif
 }
 
-void Mpeg1VideoDecoder::decodeOrResync() {
+bool Mpeg1VideoDecoder::skipToKeyframe() {
 	if (m_waitForKeyframe) {
 		// Discard up to the next group of pictures or sequence header, leaving it unread
 		while (m_stream.used() >= 4) {
@@ -80,9 +80,13 @@ void Mpeg1VideoDecoder::decodeOrResync() {
 			}
 			m_stream.nextByte();
 		}
-		if (m_waitForKeyframe) {
-			return;
-		}
+	}
+	return !m_waitForKeyframe;
+}
+
+void Mpeg1VideoDecoder::decodeOrResync() {
+	if (!skipToKeyframe()) {
+		return;
 	}
 	// The pictures that triggered this call may have been discarded above; wait for a complete one
 	if (m_stream.scanCodeCount() < 2) {
@@ -136,7 +140,8 @@ void Mpeg1VideoDecoder::flush() {
 	// second pass. Sequence end codes give the start code reader something to stop on (zero bytes would be
 	// skipped as stuffing).
 	// Nothing decoded yet is fine: a stream with one picture (a DVD menu still) only has one picture start code
-	if (m_decodeState == IDLE && (m_stream.used() < 4 || m_waitForKeyframe)) {
+	// A stream of one picture never calls decodeOrResync(), so the wait for a keyframe after reset() ends here
+	if (!skipToKeyframe() || (m_decodeState == IDLE && m_stream.used() < 4)) {
 		return;
 	}
 	for (int i = 0; i < 8 && !m_stream.isFull(); i++) {

@@ -172,6 +172,8 @@ public:
 	void emitHeldAnchor();
 	// Decodes, recovering from corrupt data by skipping to the next picture
 	void decodeOrResync();
+	// After reset(): discards data up to the next group of pictures or sequence header. False if none is buffered yet.
+	bool skipToKeyframe();
 	void resync();
 	// Discards all buffered data and decoding state, e.g. after seeking. Waits for the next I-frame.
 	void reset();

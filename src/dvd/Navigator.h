@@ -77,6 +77,11 @@ namespace Dvd {
 		void previousChapter();
 		// Plays a cell of the current program chain, e.g. to seek
 		void jumpToCell(int cell);
+		// Finishes the current program chain at once, as if its cells and stills had all played: runs its cell
+		// and post commands, so the disc decides where to go next
+		void skipProgramChain();
+		// The program chain is a menu's entry (a root menu, title menu, ...), rather than one only reached by links
+		[[nodiscard]] bool inMenuEntryPgc() const;
 
 		// Highlighted button, 1-36
 		[[nodiscard]] int highlightedButton() const { return m_sprm[8] >> 10; }

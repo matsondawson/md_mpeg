@@ -68,6 +68,14 @@ To play a DVD with its menus, pass its `VIDEO_TS` folder, the folder holding it,
 
 A single `.vob` file plays as a program stream, without menus.
 
+A DVD's copyright and piracy warnings, studio logos and trailers before its first menu are skipped: each program
+chain without menu buttons that is shorter than 3 minutes, until the first menu or a longer program chain. Skipping
+follows the disc's own commands for what comes next. Pass `--no-skip` to play them:
+
+```bash
+./build/md_mpeg --no-skip <path-to-dvd-folder>
+```
+
 ### Controls
 
 | Key | Action |
@@ -85,6 +93,7 @@ Playing a DVD folder:
 | Enter, or click | Choose the menu button (moving the mouse over a button selects it) |
 | M / T | Root menu / title menu |
 | Page Down / Page Up | Next / previous chapter |
+| N | Skip what is playing (e.g. a warning) to where the disc goes after it; not in a menu |
 
 ### Install and "Open with"
 
@@ -148,6 +157,10 @@ DVD folders are played with the MPEG-2 option. `src/dvd/` reads the information 
 `.BUP` copies), runs the discs' navigation commands from First Play through menus and titles, decodes menu button and
 subtitle sub-pictures and draws button highlights from the navigation packs. The formats follow the documentation of
 the libdvdread and libdvdnav projects and the DVD-Video pages at dvd.sourceforge.net.
+
+`Dvd::IntroSkipper` (`src/dvd/IntroSkipper.h`) chooses the program chains to skip before the first menu, judging each
+from its first navigation pack. `Navigator::skipProgramChain()` skips one as if its cells and stills had all played,
+running its cell and post commands.
 
 Not supported yet: choosing audio and subtitle streams (the disc's defaults are used, with only forced subtitles
 shown), camera angles (the first is played), DTS audio, encrypted (CSS) discs, the navigation timer, and

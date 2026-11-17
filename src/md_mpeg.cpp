@@ -23,18 +23,31 @@
 #endif
 
 int main(int argc, char *argv[]) {
-	if (argc < 2) {
-		std::cerr << "Usage: " << argv[0] << " video.mpg|VIDEO_TS folder\n";
+	const char *path = nullptr;
+	[[maybe_unused]] bool skipIntro = true;
+	for (int i = 1; i < argc; i++) {
+		if (std::strcmp(argv[i], "--no-skip") == 0) {
+			skipIntro = false;
+		} else if (!path && argv[i][0] != '-') {
+			path = argv[i];
+		} else {
+			path = nullptr;
+			break;
+		}
+	}
+	if (!path) {
+		std::cerr << "Usage: " << argv[0] << " [--no-skip] video.mpg|VIDEO_TS folder\n"
+			"  --no-skip  play a DVD's warnings, logos and trailers before its menu\n";
 		return 1;
 	}
 
 	ScreenContextRgbSDL sdl;
-	sdl.setTitle(std::filesystem::path(argv[1]).filename().string() + " - md_mpeg");
+	sdl.setTitle(std::filesystem::path(path).filename().string() + " - md_mpeg");
 #if MD_MPEG_ENABLE_MPEG2
 	// A DVD-Video folder plays from its menus
-	if (Dvd::Disc::isDvd(argv[1])) {
+	if (Dvd::Disc::isDvd(path)) {
 		try {
-			return playDvd(sdl, argv[1]);
+			return playDvd(sdl, path, skipIntro);
 		} catch (const std::exception &ex) {
 			std::cout << ex.what() << std::endl;
 			return 1;
@@ -49,12 +62,13 @@ int main(int argc, char *argv[]) {
 	const auto playbackStartMs = now();
 	bool streamFailed = false;
 
-	MStream::FileStreamRead fs(argv[1]);
+	MStream::FileStreamRead fs(path);
 	Mpeg1::MpegProgramStream mps;
 	Mpeg1VideoDecoder videoDecoder;
 	mps.setVideoDecoder(&videoDecoder);
 	AudioDecoders audioDecoder;
 	audioDecoder.attach(mps);
+	const AudioOutputCloser audioCloser(sdl);
 	mps.buildTimeline(fs);
 
 	// Audio is the master clock when there is audio, otherwise wall time
