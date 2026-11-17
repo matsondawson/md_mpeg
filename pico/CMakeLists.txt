@@ -93,6 +93,8 @@ function(add_decoder_app name main_source)
 		MD_MPEG_SPARSE_IDCT=$<BOOL:${MD_MPEG_SPARSE_IDCT}>
 		MD_MPEG_AUDIO_MONO=$<BOOL:${MD_MPEG_AUDIO_MONO}>
 		MD_MPEG_ENABLE_MPEG2=$<BOOL:${MD_MPEG_ENABLE_MPEG2}>
+		# Counters only: no diagnostic messages or callback (see src/Diagnostics.h)
+		MD_MPEG_DIAGNOSTICS=0
 		MD_MPEG_DEMUX_RING_SIZE=512
 		MD_MPEG_VIDEO_RING_SIZE=${MD_MPEG_PICO_VIDEO_RING_SIZE}
 		MD_MPEG_AUDIO_RING_SIZE=384

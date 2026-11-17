@@ -366,7 +366,25 @@ namespace {
 		s_stats.idleUs += time_us_64() - start;
 	}
 
-	void report() {
+	// Corrupt input met since the file started, from the demuxer and decoders' counters. The audio decoder's
+	// are written by core 1 when it decodes audio; each count is a word, so reading one is safe.
+	void reportDiagnostics(const Diagnostics &diagnostics) {
+		if (diagnostics.total() == 0) {
+			return;
+		}
+		printf("  input errors:");
+		const char *separator = " ";
+		for (size_t i = 0; i < DIAGNOSTIC_COUNT; i++) {
+			const auto diagnostic = static_cast<Diagnostic>(i);
+			if (diagnostics[diagnostic]) {
+				printf("%s%lu %s", separator, diagnostics[diagnostic], diagnosticName(diagnostic));
+				separator = ", ";
+			}
+		}
+		printf("\n");
+	}
+
+	void report(const Diagnostics &diagnostics) {
 		const uint64_t now = time_us_64();
 		const auto elapsedUs = static_cast<double>(now - s_stats.startUs);
 		const uint32_t convertUs = s_core1ConvertUs, scanUs = s_core1ScanUs;
@@ -391,6 +409,7 @@ namespace {
 		s_timedCard.maxUs = 0;
 #endif
 		printf("  video ring peak %lu of %d bytes\n", s_videoRingPeak, MD_MPEG_VIDEO_RING_SIZE);
+		reportDiagnostics(diagnostics);
 		s_stats = Stats{};
 		s_stats.startUs = now;
 #if VIDEO_FROM_SD
@@ -483,7 +502,10 @@ namespace {
 
 			s_stats.shown++;
 			if (s_stats.shown + s_stats.skipped >= REPORT_FRAMES) {
-				report();
+				Diagnostics diagnostics = demuxer->diagnostics();
+				diagnostics.add(videoDecoder->diagnostics());
+				diagnostics.add(audioDecoder->diagnostics());
+				report(diagnostics);
 			}
 		});
 		try {

@@ -107,7 +107,7 @@ namespace {
 				}
 				const int32_t level = static_cast<int32_t>(random() % 4096) - 2048;
 				const int32_t small = static_cast<int32_t>(random() % 64) - 32;
-				reference[index] = ((random() & 3) ? small : level) * VIDEO_PREMULTIPLIER_MATRIX[index];
+				reference[index] = videoPremultiply((random() & 3) ? small : level, index);
 				masks |= idctMaskBits(index);
 			}
 			const bool add = random() & 1;

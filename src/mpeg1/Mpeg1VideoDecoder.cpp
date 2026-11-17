@@ -105,7 +105,7 @@ void Mpeg1VideoDecoder::decodeOrResync() {
 			// Not the stream's fault, and every later picture would fail the same way
 			throw;
 		} catch (const std::exception &ex) {
-			std::cout << "Corrupt video, skipping to next picture: " << ex.what() << std::endl;
+			MD_MPEG_REPORT(m_diagnostics, Diagnostic::CorruptVideo, 1, ex.what());
 			resync();
 		}
 	} while (m_stream.scanCodeCount() >= 2 && m_stream.used() != usedBefore);
@@ -155,7 +155,7 @@ void Mpeg1VideoDecoder::flush() {
 	} catch (const MStream::EndOfData &) {
 		// Final picture was truncated
 	} catch (const std::exception &ex) {
-		std::cout << "Video end of stream: " << ex.what() << std::endl;
+		MD_MPEG_REPORT(m_diagnostics, Diagnostic::CorruptVideo, 1, ex.what());
 	}
 	// If the last picture was cut short, the anchor frame held back for after it is still due
 	if (forwardFrameIndex != static_cast<uint32_t>(-1)) {

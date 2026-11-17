@@ -1,5 +1,6 @@
 #include "DvdPlayer.h"
 
+#include "DiagnosticPrinter.h"
 #include "mpeg1/MpegProgramStream.h"
 
 #if MD_MPEG_ENABLE_MPEG2
@@ -49,6 +50,7 @@ int playDvd(ScreenContextRgbSDL &sdl, const std::string &path, const bool skipIn
 	mps.setVideoDecoder(video.get());
 	AudioDecoders audio;
 	audio.attach(mps);
+	printDiagnostics(mps, *video, audio);
 	const AudioOutputCloser audioCloser(sdl);
 	Dvd::NavPackDecoder navPacks;
 	mps.setNavigationDecoder(&navPacks);

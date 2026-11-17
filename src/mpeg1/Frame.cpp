@@ -5,6 +5,7 @@
 #include "PixelWords.h"
 #include "VideoInternal.h"
 
+#include <stdexcept>
 #include <cstring>
 
 // The Cortex-M0+ assembler IDCT, pico/idct_m0.S, which also stores the result and clears the block
@@ -107,21 +108,23 @@ const static uint16_t us_motionVector1[] =
 
 const static int16_t *s_motionVector1 = (int16_t *) us_motionVector1;
 
-const uint8_t VIDEO_PREMULTIPLIER_MATRIX[] = {
-	32, 44, 42, 38, 32, 25, 17, 9,
-	44, 62, 58, 52, 44, 35, 24, 12,
-	42, 58, 55, 49, 42, 33, 23, 12,
-	38, 52, 49, 44, 38, 30, 20, 10,
-	32, 44, 42, 38, 32, 25, 17, 9,
-	25, 35, 33, 30, 25, 20, 14, 7,
-	17, 24, 23, 20, 17, 14, 9, 5,
-	9, 12, 12, 10, 9, 7, 5, 2
+// round(2^14 * a(u) * a(v)), a(0) = 1 and a(u) = sqrt(2) cos(u pi / 16): the AAN IDCT's scale factors, at twice the
+// IDCT's working scale (DC 64) with 8 more bits, which videoPremultiply rounds away
+const uint16_t VIDEO_PREMULTIPLIER_MATRIX[] = {
+	16384, 22725, 21407, 19266, 16384, 12873,  8867,  4520,
+	22725, 31521, 29692, 26722, 22725, 17855, 12299,  6270,
+	21407, 29692, 27969, 25172, 21407, 16819, 11585,  5906,
+	19266, 26722, 25172, 22654, 19266, 15137, 10426,  5315,
+	16384, 22725, 21407, 19266, 16384, 12873,  8867,  4520,
+	12873, 17855, 16819, 15137, 12873, 10114,  6967,  3552,
+	 8867, 12299, 11585, 10426,  8867,  6967,  4799,  2446,
+	 4520,  6270,  5906,  5315,  4520,  3552,  2446,  1247
 };
 
 
 // Skip the arithmetic for columns and rows whose only non-zero coefficient is the first. Most are like that,
 // and the result is the same: such a column transforms to its first value in every row, and such a row to
-// (first + 128) >> 8 in every column.
+// first >> 9 in every column (the rounding is already in the first coefficient).
 #ifndef MD_MPEG_SPARSE_IDCT
 #define MD_MPEG_SPARSE_IDCT 1
 #endif
@@ -130,6 +133,10 @@ const uint8_t VIDEO_PREMULTIPLIER_MATRIX[] = {
 void video_idct(int32_t *block) {
 	int b1, b3, b4, b6, b7, tmp1, tmp2, m0,
 			x0, x1, x2, x3, x4, y3, y4, y5, y6, y7;
+
+	// Every output includes the first coefficient exactly once, unmultiplied, so this rounds them all for the
+	// final >> 9
+	block[0] += VIDEO_IDCT_ROUNDING;
 
 	// Transform columns
 	for (int i = 0; i < 8; ++i) {
@@ -178,7 +185,7 @@ void video_idct(int32_t *block) {
 #if MD_MPEG_SPARSE_IDCT
 		if ((block[1 + i] | block[2 + i] | block[3 + i] | block[4 + i] | block[5 + i] | block[6 + i] |
 		     block[7 + i]) == 0) {
-			const int32_t value = (block[i] + 128) >> 8;
+			const int32_t value = block[i] >> VIDEO_IDCT_SHIFT;
 			for (int column = 0; column < 8; column++) {
 				block[column + i] = value;
 			}
@@ -203,14 +210,14 @@ void video_idct(int32_t *block) {
 		y5 = x1 - x2;
 		y6 = x3 - b3;
 		y7 = -x0 - ((b4 * 473 + b6 * 196 + 128) >> 8);
-		block[0 + i] = (b7 + y4 + 128) >> 8;
-		block[1 + i] = (x4 + y3 + 128) >> 8;
-		block[2 + i] = (y5 - x0 + 128) >> 8;
-		block[3 + i] = (y6 - y7 + 128) >> 8;
-		block[4 + i] = (y6 + y7 + 128) >> 8;
-		block[5 + i] = (x0 + y5 + 128) >> 8;
-		block[6 + i] = (y3 - x4 + 128) >> 8;
-		block[7 + i] = (y4 - b7 + 128) >> 8;
+		block[0 + i] = (b7 + y4) >> VIDEO_IDCT_SHIFT;
+		block[1 + i] = (x4 + y3) >> VIDEO_IDCT_SHIFT;
+		block[2 + i] = (y5 - x0) >> VIDEO_IDCT_SHIFT;
+		block[3 + i] = (y6 - y7) >> VIDEO_IDCT_SHIFT;
+		block[4 + i] = (y6 + y7) >> VIDEO_IDCT_SHIFT;
+		block[5 + i] = (x0 + y5) >> VIDEO_IDCT_SHIFT;
+		block[6 + i] = (y3 - x4) >> VIDEO_IDCT_SHIFT;
+		block[7 + i] = (y4 - b7) >> VIDEO_IDCT_SHIFT;
 	}
 }
 
@@ -285,15 +292,21 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 		int8_t forward_f_code;
 		PULL2(full_pel_forward_vector, 1, forward_f_code, 3);
 
-		assert(forward_f_code != 0);
-		// f_code is 1..7, so r_size is 0..6
+		// f_code is 1..7, so r_size is 0..6; 0 is forbidden
+		if (forward_f_code == 0) {
+			m_diagnostics.count(Diagnostic::InvalidHeader);
+			throw std::runtime_error("Invalid f_code");
+		}
 		forward_r_size = forward_f_code - 1;
 
 		if (picture_coding_type == VideoPictureType_B) {
 			int8_t backward_f_code;
 			PULL2(full_pel_backward_vector, 1, backward_f_code, 3);
 
-			assert(backward_f_code != 0);
+			if (backward_f_code == 0) {
+				m_diagnostics.count(Diagnostic::InvalidHeader);
+				throw std::runtime_error("Invalid f_code");
+			}
 			backward_r_size = backward_f_code - 1;
 		}
 
@@ -347,6 +360,10 @@ uint32_t Mpeg1VideoDecoder::decodeFrame() {
 }
 
 void Mpeg1VideoDecoder::processSlice(uint32_t slice) {
+	if (m_macroblockWidth == 0) {
+		// No sequence header yet
+		throw std::runtime_error("Slice before a sequence header");
+	}
 	// std::cout << "slice: " << std::hex << lastStartCode() << "\n";
 	assert(slice > 0);
 	macroblock_address = (slice - 1) * m_macroblockWidth - 1;
@@ -544,6 +561,11 @@ void Mpeg1VideoDecoder::predictMacroblock() const {
 
 void Mpeg1VideoDecoder::videoCopyMacroblock(const int motion_h, const int motion_v, const Frame *d) const {
 	const auto frame_current = m_ptrFrameCurrent;
+	if (!videoMotionInRange(mb_col, mb_row, m_macroblockWidth, m_macroblockHeight, motion_h, motion_v)) {
+		// Corrupt data: leave the macroblock as it is
+		MD_MPEG_REPORT(m_diagnostics, Diagnostic::BadMotionVector, 1, "Motion vector out of range");
+		return;
+	}
 	videoProcessMacroblock(frame_current->m_yData, d->m_yData, motion_h, motion_v, 16);
 	videoProcessMacroblock(frame_current->m_crData, d->m_crData, motion_h / 2, motion_v / 2, 8);
 	videoProcessMacroblock(frame_current->m_cbData, d->m_cbData, motion_h / 2, motion_v / 2, 8);
@@ -551,6 +573,10 @@ void Mpeg1VideoDecoder::videoCopyMacroblock(const int motion_h, const int motion
 
 void Mpeg1VideoDecoder::videoInterpolateMacroblock(const int motion_h, const int motion_v, const Frame *d) const {
 	const auto frame_current = m_ptrFrameCurrent;
+	if (!videoMotionInRange(mb_col, mb_row, m_macroblockWidth, m_macroblockHeight, motion_h, motion_v)) {
+		MD_MPEG_REPORT(m_diagnostics, Diagnostic::BadMotionVector, 1, "Motion vector out of range");
+		return;
+	}
 	videoProcessMacroblockInterpolate(frame_current->m_yData, d->m_yData, motion_h, motion_v, 16);
 	videoProcessMacroblockInterpolate(frame_current->m_crData, d->m_crData, motion_h / 2, motion_v / 2, 8);
 	videoProcessMacroblockInterpolate(frame_current->m_cbData, d->m_cbData, motion_h / 2, motion_v / 2, 8);
@@ -632,7 +658,7 @@ template void videoPredictBlockHalfPel<8, false>(uint8_t *, const uint8_t *, uin
 template void videoPredictBlockHalfPel<8, true>(uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t);
 
 // One plane of a macroblock's prediction. d starts at a multiple of 8 pixels in a plane whose width is a
-// multiple of 8, so its rows are word aligned.
+// multiple of 8, so its rows are word aligned. The caller has checked the vector with videoMotionInRange.
 template <bool INTERPOLATE>
 static void videoPredictPlane(uint8_t *d, const uint8_t *s, const uint32_t mb_row, const uint32_t mb_col,
                               const uint32_t macroblockWidth, const uint32_t macroblockHeight, const int motion_h,
@@ -640,17 +666,10 @@ static void videoPredictPlane(uint8_t *d, const uint8_t *s, const uint32_t mb_ro
 	const uint32_t dw = macroblockWidth * block_size;
 
 	const int32_t hp = motion_h >> 1, vp = motion_v >> 1;
+	const uint32_t halfPel = ((motion_h & 1) << 1) | (motion_v & 1);
 	const uint32_t si = ((mb_row * block_size) + vp) * dw + (mb_col * block_size) + hp;
 	const uint32_t di = (mb_row * dw + mb_col) * block_size;
 
-	const uint32_t max_address = (dw * (macroblockHeight * block_size - block_size + 1) - block_size);
-	if (si > max_address || di > max_address) {
-		// Motion vector points outside the frame (corrupt data), leave the block as it is
-		debug_out << "Motion vector out of range" << std::endl;
-		return;
-	}
-
-	const uint32_t halfPel = ((motion_h & 1) << 1) | (motion_v & 1);
 	if (block_size == 16) {
 		videoPredictBlockHalfPel<16, INTERPOLATE>(d + di, s + si, dw, halfPel, 16);
 	} else {
@@ -714,8 +733,8 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 			// Save predictor value
 			dc_predictor[plane_index] = block_data[0];
 
-			// Dequantize + premultiply
-			block_data[0] <<= (3 + 5);
+			// Dequantize (x 8) and premultiply
+			block_data[0] <<= (3 + VIDEO_DC_PREMULTIPLY_SHIFT);
 
 			n = 1;
 			quant_matrix = intra_quant_matrix;
@@ -737,9 +756,8 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 
 			level = dequantizeMpeg1(level, false, quantizer_scale, quant_matrix[de_zig_zagged]);
 
-			// level is 12 bits, premul is 6bits = 18bits so block data has to be int32
-			// Save premultiplied coefficient
-			block_data[de_zig_zagged] = level * VIDEO_PREMULTIPLIER_MATRIX[de_zig_zagged];
+						// Save premultiplied coefficient
+			block_data[de_zig_zagged] = videoPremultiply(level, de_zig_zagged);
 		}
 
 		if (picture_coding_type != VideoPictureType_D) {
@@ -760,9 +778,8 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 				IDCT_MASK(masks, de_zig_zagged);
 
 				level = dequantizeMpeg1(level, macroblock_intra, quantizer_scale, quant_matrix[de_zig_zagged]);
-				// level is 12 bits, premul is 6bits = 18bits so block data has to be int32
-				// Save premultiplied coefficient
-				block_data[de_zig_zagged] = level * VIDEO_PREMULTIPLIER_MATRIX[de_zig_zagged];
+								// Save premultiplied coefficient
+				block_data[de_zig_zagged] = videoPremultiply(level, de_zig_zagged);
 			}
 			m_bitStream.skip(2);
 		}
@@ -797,7 +814,7 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 		if (macroblock_intra) {
 			// Overwrite (no prediction)
 			if (n == 1) {
-				int clamped = clampToByte((s[0] + 128) >> 8);
+				int clamped = clampToByte(videoDcValue(s[0]));
 				BLOCK_SET(d, di, dw, si, 8, 8, clamped);
 				s[0] = 0;
 			} else {
@@ -812,7 +829,7 @@ void Mpeg1VideoDecoder::decodeBlock(uint32_t cbp) {
 		} else {
 			// Add data to the predicted macroblock
 			if (n == 1) {
-				int value = (s[0] + 128) >> 8;
+				int value = videoDcValue(s[0]);
 				BLOCK_SET(d, di, dw, si, 8, 8, clampToByte(d[di] + value));
 				s[0] = 0;
 			} else {

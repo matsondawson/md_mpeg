@@ -21,6 +21,7 @@ option(MD_MPEG_AUDIO_FIXED_POINT "Decode audio with 32-bit integer arithmetic an
 option(MD_MPEG_SPARSE_IDCT "Skip the IDCT arithmetic for rows and columns with only a first coefficient" ON)
 option(MD_MPEG_AUDIO_MONO "Mix stereo audio to mono before the synthesis filter, halving its work" OFF)
 option(MD_MPEG_ENABLE_MPEG2 "Decode MPEG-2 video and program streams, and A/52 and LPCM audio, as well as MPEG-1" ON)
+option(MD_MPEG_DIAGNOSTICS "Compile in diagnostic messages and their callback, not just the counters (src/Diagnostics.h)" ON)
 
 # Demuxing and decoding, no SDL dependency. Shared by the player and the tests.
 add_library(md_mpeg_core STATIC
@@ -51,6 +52,7 @@ target_compile_definitions(md_mpeg_core PUBLIC
 	MD_MPEG_AUDIO_MONO=$<BOOL:${MD_MPEG_AUDIO_MONO}>
 	# Public: it changes the decoder classes' layout
 	MD_MPEG_ENABLE_MPEG2=$<BOOL:${MD_MPEG_ENABLE_MPEG2}>
+	MD_MPEG_DIAGNOSTICS=$<BOOL:${MD_MPEG_DIAGNOSTICS}>
 )
 target_compile_definitions(md_mpeg_core PRIVATE MD_MPEG_SPARSE_IDCT=$<BOOL:${MD_MPEG_SPARSE_IDCT}>)
 
@@ -72,6 +74,25 @@ add_executable(md_mpeg_tests "tests/md_mpeg_tests.cpp")
 target_link_libraries(md_mpeg_tests PRIVATE md_mpeg_core)
 add_test(NAME md_mpeg_tests COMMAND md_mpeg_tests "${CMAKE_CURRENT_BINARY_DIR}/test_media")
 set_tests_properties(md_mpeg_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+# The fuzz harness run on the saved inputs that once crashed or hung it
+add_executable(md_mpeg_fuzz_replay "tests/md_mpeg_fuzz.cpp" "tests/md_mpeg_fuzz_replay.cpp")
+target_link_libraries(md_mpeg_fuzz_replay PRIVATE md_mpeg_core)
+add_test(NAME md_mpeg_fuzz_regressions COMMAND md_mpeg_fuzz_replay "${CMAKE_SOURCE_DIR}/tests/fuzz_regressions")
+set_tests_properties(md_mpeg_fuzz_regressions PROPERTIES TIMEOUT 60)
+
+# Cases for tests/asm_check.py, which runs the Pico's assembler in an emulator against the decoder's C
+add_executable(md_mpeg_asm_vectors "tests/md_mpeg_asm_vectors.cpp")
+target_link_libraries(md_mpeg_asm_vectors PRIVATE md_mpeg_core)
+
+# Fuzzer: needs Clang. scripts/check.sh builds and runs it; build with
+# -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,fuzzer-no-link" so the decoder is instrumented too.
+option(MD_MPEG_FUZZ "Build md_mpeg_fuzz, the libFuzzer harness" OFF)
+if(MD_MPEG_FUZZ)
+	add_executable(md_mpeg_fuzz "tests/md_mpeg_fuzz.cpp")
+	target_link_libraries(md_mpeg_fuzz PRIVATE md_mpeg_core)
+	target_link_options(md_mpeg_fuzz PRIVATE -fsanitize=fuzzer)
+endif()
 
 # Install the player and a desktop entry so it shows in "Open with" for MPEG files
 include(GNUInstallDirs)

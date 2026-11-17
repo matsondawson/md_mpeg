@@ -16,6 +16,7 @@
 #include <memory>
 
 #include "AudioSample.h"
+#include "../Diagnostics.h"
 #include "../stream/MStream.h"
 #include "../stream/RingBufferWithSizeEvent.h"
 
@@ -38,6 +39,11 @@ public:
 
 	void setFrameCallback(const FrameCallback &frameCallback);
 
+	// Corrupt and unsupported input this has met
+	Diagnostics &diagnostics() { return m_diagnostics; }
+	[[nodiscard]] const Diagnostics &diagnostics() const { return m_diagnostics; }
+
+
 	[[nodiscard]] int32_t firstFramePtsMillis() const { return m_firstFramePtsMillis; }
 	// Channels in the output, 0 until the first frame is decoded
 	[[nodiscard]] uint32_t channels() const { return m_outputChannels; }
@@ -58,6 +64,7 @@ public:
 	void discontinuity() override;
 
 private:
+	Diagnostics m_diagnostics;
 	// The 6 bytes up to bsid, enough to validate a frame header
 	static constexpr uint32_t HEADER_SIZE = 6;
 
