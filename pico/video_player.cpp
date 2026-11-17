@@ -67,7 +67,7 @@ namespace {
 		// The output lines being sent or about to be. A line being sent can't be changed, and sendPixels()
 		// returns once the line before the one it's given has gone.
 		static FrameScanner scanner;
-		static uint16_t output[3][SCREEN_WIDTH];
+		alignas(4) static uint16_t output[3][(SCREEN_WIDTH + 1) & ~1u];
 		uint32_t nextOutput = 0;
 
 		scanner.begin(frame);

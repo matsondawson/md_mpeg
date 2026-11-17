@@ -114,8 +114,8 @@ namespace profiler {
 		timer_hw->intr = 1u << ALARM;
 	}
 
-	void print() {
-		printf("profile: %lu samples, %lu missed, %u byte buckets\n", samples, missed, 1u << BUCKET_SHIFT);
+	void print(const char *name) {
+		printf("profile: %s, %lu samples, %lu missed, %u byte buckets\n", name, samples, missed, 1u << BUCKET_SHIFT);
 		const auto dump = [](const uint16_t *counts, const uint32_t buckets, const uint32_t base) {
 			for (uint32_t i = 0; i < buckets; i++) {
 				if (counts[i]) {
@@ -269,7 +269,7 @@ namespace {
 		const char *error = "";
 	};
 
-	__attribute__((noinline)) void run(Result &result, const bool hash) {
+	__attribute__((noinline)) void run(Result &result, const bool hash, const bool screen = false) {
 		ClipStream clip;
 		auto demuxer = std::make_unique<Mpeg1::MpegProgramStream>();
 		auto videoDecoder = std::make_unique<Mpeg1VideoDecoder>();
@@ -289,22 +289,26 @@ namespace {
 		videoDecoder->setFrameCallback([&](const Frame &frame) {
 			result.frames++;
 			g_frames = result.frames;
-			if (hash) {
-				rgb.resize(frame.m_width * frame.m_height);
-				videoDecoder->generateRgbFrameData(rgb.data(), frame);
-				result.videoHash = fnv(result.videoHash, rgb.data(), rgb.size() * sizeof(uint32_t));
+			if (hash || screen) {
+				if (hash) {
+					rgb.resize(frame.m_width * frame.m_height);
+					videoDecoder->generateRgbFrameData(rgb.data(), frame);
+					result.videoHash = fnv(result.videoHash, rgb.data(), rgb.size() * sizeof(uint32_t));
+				}
 				if (frame.m_width != s_plan.sourceWidth || frame.m_height != s_plan.sourceHeight) {
 					buildPlan(frame.m_width, frame.m_height);
 				}
 				static FrameScanner scanner;
-				static uint16_t line[SCREEN_WIDTH];
+				alignas(4) static uint16_t line[SCREEN_WIDTH];
 				uint32_t screenUs = 0;
 				scanner.begin(frame);
 				for (uint32_t y = 0; y < SCREEN_HEIGHT; y++) {
 					const auto lineStart = micros();
 					scanner.line(y, line);
 					screenUs += micros() - lineStart;
-					result.screenHash = fnv(result.screenHash, line, s_plan.outputWidth * sizeof(uint16_t));
+					if (hash) {
+						result.screenHash = fnv(result.screenHash, line, s_plan.outputWidth * sizeof(uint16_t));
+					}
 				}
 				result.screenUs += screenUs;
 				result.screenMaxUs = std::max(result.screenMaxUs, screenUs);
@@ -446,12 +450,13 @@ int main() {
 	Result hashed;
 	run(hashed, true);
 
+	// Decoding and converting each frame for the screen
 	Result profiled;
 	const bool profiling = clockSet && profiler::allocate();
 	if (profiling) {
 		printf("Profiling...\n");
 		profiler::start();
-		run(profiled, false);
+		run(profiled, false, true);
 		profiler::stop();
 	}
 
@@ -470,7 +475,7 @@ int main() {
 		       hashed.frames ? static_cast<double>(hashed.screenUs) / 1000.0 / hashed.frames : 0.0,
 		       static_cast<double>(hashed.screenMaxUs) / 1000.0, hashed.screenHash);
 		if (profiling) {
-			profiler::print();
+			profiler::print("decode");
 		}
 		printf("==== end ====\n");
 		fflush(stdout);

@@ -194,19 +194,51 @@ namespace {
 		}
 	}
 
-	// Blends two scaled lines into display order, which is big-endian
+	// Two RGB565 pixels in a word, averaged as average() does each: halving each field first can't carry
+	inline uint32_t average2(const uint32_t a, const uint32_t b) {
+		return ((a >> 1) & 0x7BEF7BEFu) + ((b >> 1) & 0x7BEF7BEFu);
+	}
+
+	template <uint32_t QUARTERS>
+	inline uint32_t blend2(const uint32_t a, const uint32_t b) {
+		if constexpr (QUARTERS == 0) {
+			return a;
+		} else if constexpr (QUARTERS == 1) {
+			return average2(a, average2(a, b));
+		} else if constexpr (QUARTERS == 2) {
+			return average2(a, b);
+		} else {
+			return average2(average2(a, b), b);
+		}
+	}
+
+	// Swaps the bytes of each halfword
+	inline uint32_t reverse16(const uint32_t value) {
+		uint32_t result;
+		__asm("rev16 %0, %1" : "=l"(result) : "l"(value));
+		return result;
+	}
+
+	// Blends two scaled lines into display order, which is big-endian, two pixels at a time. The lines are
+	// word aligned.
 	template <uint32_t QUARTERS>
 	void __not_in_flash_func(blendLines)(const uint16_t *a, const uint16_t *b, uint16_t *out, const uint32_t width) {
-		for (uint32_t x = 0; x < width; x++) {
-			out[x] = __builtin_bswap16(blend<QUARTERS>(a[x], b[x]));
+		const auto *a2 = reinterpret_cast<const uint32_t *>(a);
+		const auto *b2 = reinterpret_cast<const uint32_t *>(b);
+		auto *out2 = reinterpret_cast<uint32_t *>(out);
+		for (uint32_t x = 0; x < width / 2; x++) {
+			out2[x] = reverse16(blend2<QUARTERS>(a2[x], b2[x]));
+		}
+		if (width & 1) {
+			out[width - 1] = __builtin_bswap16(blend<QUARTERS>(a[width - 1], b[width - 1]));
 		}
 	}
 
 	// Produces a frame's screen lines in order, converting and scaling each source line once
 	class FrameScanner {
 		// One converted source line, and the last two source lines scaled to the screen's width
-		uint16_t m_source[MAX_SOURCE_SPAN];
-		uint16_t m_scaled[2][SCREEN_WIDTH];
+		alignas(4) uint16_t m_source[MAX_SOURCE_SPAN];
+		alignas(4) uint16_t m_scaled[2][(SCREEN_WIDTH + 1) & ~1u];
 		int32_t m_scaledRow[2] = {-1, -1};
 		const Frame *m_frame = nullptr;
 
@@ -231,7 +263,7 @@ namespace {
 			m_scaledRow[0] = m_scaledRow[1] = -1;
 		}
 
-		// Screen line y, s_plan.outputWidth pixels, into out. Lines must come in order from 0.
+		// Screen line y, s_plan.outputWidth pixels, into out, which is word aligned. Lines must come in order from 0.
 		void __not_in_flash_func(line)(const uint32_t y, uint16_t *out) {
 			const uint32_t width = s_plan.outputWidth;
 			const uint32_t position = s_plan.rows[y];
