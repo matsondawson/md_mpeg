@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 
+#include "../AudioStallDetector.h"
 #include "../mpeg1/AudioSample.h"
 #include "ControlBar.h"
 
@@ -86,6 +87,8 @@ private:
 	bool m_audioPaused = false;
 	int32_t m_audioStartPtsMs = 0;
 	int32_t m_deviceLatencyMs = 0;
+	// The output stopped asking for audio; it is then discarded and the clock falls back to wall time
+	AudioStallDetector m_stallDetector;
 
 public:
 	ScreenContextRgbSDL();
@@ -106,7 +109,8 @@ public:
 	void setAudioPaused(bool paused);
 	// Stops playback and discards all buffered audio (e.g. after seeking). startAudio() restarts it.
 	void resetAudio();
-	// PTS (ms) of the sample currently audible, or nullopt if audio isn't playing or has run dry
+	// PTS (ms) of the sample currently audible, or nullopt if audio isn't playing, has run dry, or the output
+	// has stalled. Once stalled, buffered audio is discarded so decoding carries on, until resetAudio().
 	[[nodiscard]] std::optional<int64_t> audioClockMs();
 
 	[[nodiscard]] uint32_t* rgbData() const;
