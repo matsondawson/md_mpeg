@@ -5,10 +5,18 @@
 // Sectors are read with a multiple block read left open, so reading the sector after the last one is just
 // the next block of the stream. Reading any other sector stops the stream and starts a new one.
 //
+// After each sector, DMA reads ahead the next block of the stream while the caller works, so reading the next
+// sector is usually just a copy. The card sends 0xFF until a block's start token, and the DMA can only start
+// after it, as reading past the block would lose the next one's token. Mid-stream the token comes quickly, so
+// it's waited for briefly, and without it the next sector is read as without read ahead.
+//
 // Wiring: SCK GP10, MOSI GP11, MISO GP12, CS GP13.
 
 #include <cstdint>
 
+#include <cstring>
+
+#include "hardware/dma.h"
 #include "hardware/spi.h"
 #include "pico/stdlib.h"
 
@@ -43,6 +51,18 @@ class SdCard {
 	// A multiple block read is open, with the card selected, and its next block is m_nextLba
 	bool m_streaming = false;
 	uint32_t m_nextLba = 0;
+
+	// Read ahead: the block and its 2 byte CRC
+	static constexpr uint32_t BLOCK_AND_CRC = 514;
+	// Bytes to wait for the next block's start token before giving up on reading it ahead
+	static constexpr uint32_t TOKEN_WAIT_BYTES = 64;
+	int m_rxChannel = -1, m_txChannel = -1;
+	// A read ahead was started for block m_nextLba
+	bool m_readingAhead = false;
+	alignas(4) uint8_t m_readAhead[BLOCK_AND_CRC];
+	static constexpr uint8_t ONES = 0xFF;
+	// A byte other than 0xFF that startReadAhead() read where the next block's start token should be
+	uint8_t m_pendingToken = 0xFF;
 
 	static uint8_t transfer(const uint8_t out = 0xFF) {
 		uint8_t in;
@@ -98,6 +118,7 @@ class SdCard {
 	// @return whether the card stopped
 	bool stopStream() {
 		m_streaming = false;
+		m_pendingToken = 0xFF;
 		// Sent straight away: the card is streaming, so it isn't busy
 		const uint8_t frame[] = {0x40 | CMD12_STOP_TRANSMISSION, 0, 0, 0, 0, 0x01};
 		spi_write_blocking(spi1, frame, sizeof(frame));
@@ -113,10 +134,11 @@ class SdCard {
 	}
 
 	// Reads the next block of a read command
-	static bool readBlock(uint8_t *buffer) {
+	bool readBlock(uint8_t *buffer) {
 		const auto deadline = make_timeout_time_ms(300);
-		uint8_t token;
-		while ((token = transfer()) == 0xFF) {
+		uint8_t token = m_pendingToken;
+		m_pendingToken = 0xFF;
+		while (token == 0xFF && (token = transfer()) == 0xFF) {
 			if (time_reached(deadline)) {
 				return false;
 			}
@@ -131,6 +153,46 @@ class SdCard {
 		return true;
 	}
 
+	void startReadAhead() {
+		uint8_t token = 0xFF;
+		for (uint32_t i = 0; i < TOKEN_WAIT_BYTES && token == 0xFF; i++) {
+			token = transfer();
+		}
+		if (token != DATA_START_TOKEN) {
+			// Not there yet, or an error token, which then reads as a failure
+			m_pendingToken = token;
+			return;
+		}
+		if (m_rxChannel < 0) {
+			m_rxChannel = dma_claim_unused_channel(true);
+			m_txChannel = dma_claim_unused_channel(true);
+		}
+		dma_channel_config rx = dma_channel_get_default_config(m_rxChannel);
+		channel_config_set_transfer_data_size(&rx, DMA_SIZE_8);
+		channel_config_set_read_increment(&rx, false);
+		channel_config_set_write_increment(&rx, true);
+		channel_config_set_dreq(&rx, spi_get_dreq(spi1, false));
+		dma_channel_configure(m_rxChannel, &rx, m_readAhead, &spi_get_hw(spi1)->dr, BLOCK_AND_CRC, false);
+		dma_channel_config tx = dma_channel_get_default_config(m_txChannel);
+		channel_config_set_transfer_data_size(&tx, DMA_SIZE_8);
+		channel_config_set_read_increment(&tx, false);
+		channel_config_set_write_increment(&tx, false);
+		channel_config_set_dreq(&tx, spi_get_dreq(spi1, true));
+		dma_channel_configure(m_txChannel, &tx, &spi_get_hw(spi1)->dr, &ONES, BLOCK_AND_CRC, false);
+		dma_start_channel_mask((1u << m_rxChannel) | (1u << m_txChannel));
+		m_readingAhead = true;
+	}
+
+	// Waits for the read ahead's DMA, which leaves the stream at the end of a block
+	void waitReadAhead() {
+		dma_channel_wait_for_finish_blocking(m_txChannel);
+		dma_channel_wait_for_finish_blocking(m_rxChannel);
+		// The last byte may still be shifting
+		while (spi_is_busy(spi1)) {
+		}
+		m_readingAhead = false;
+	}
+
 	static uint8_t appCommand(const uint8_t index, const uint32_t argument) {
 		command(CMD55_APP_CMD, 0);
 		deselect();
@@ -143,6 +205,10 @@ public:
 	 * @return nullptr, or why it failed
 	 */
 	const char *init() {
+		if (m_readingAhead) {
+			waitReadAhead();
+		}
+		m_pendingToken = 0xFF;
 		m_ready = false;
 		m_streaming = false;
 		gpio_init(PIN_CS);
@@ -231,6 +297,18 @@ public:
 		if (!m_ready) {
 			return false;
 		}
+		if (m_readingAhead) {
+			waitReadAhead();
+			if (lba == m_nextLba) {
+				// The CRC isn't checked
+				memcpy(buffer, m_readAhead, 512);
+				m_nextLba = lba + 1;
+				startReadAhead();
+				return true;
+			}
+			// The stream moved on a block, as if it had been read
+			m_nextLba++;
+		}
 		if (m_streaming && lba != m_nextLba && !stopStream()) {
 			return false;
 		}
@@ -247,6 +325,7 @@ public:
 			return false;
 		}
 		m_nextLba = lba + 1;
+		startReadAhead();
 		return true;
 	}
 };
