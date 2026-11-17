@@ -3,9 +3,10 @@
 #include "MpegProgramStream.h"
 #include "Mpeg1AudioDecoder.h"
 #include "A52AudioDecoder.h"
+#include "LpcmAudioDecoder.h"
 
 /**
- * The decoders for each audio format a program stream can carry: MP2, and A/52 when built with MPEG-2. The demuxer
+ * The decoders for each audio format a program stream can carry: MP2, and A/52 and LPCM when built with MPEG-2. The demuxer
  * only decodes the first audio stream it finds, so only one of them gets any data.
  */
 class AudioDecoders {
@@ -15,12 +16,14 @@ public:
 	Mpeg1AudioDecoder mpeg;
 #if MD_MPEG_ENABLE_MPEG2
 	A52AudioDecoder a52;
+	LpcmAudioDecoder lpcm;
 #endif
 
 	void attach(Mpeg1::MpegProgramStream &demuxer) {
 		demuxer.setAudioDecoder(&mpeg);
 #if MD_MPEG_ENABLE_MPEG2
 		demuxer.setA52AudioDecoder(&a52);
+		demuxer.setLpcmAudioDecoder(&lpcm);
 #endif
 	}
 
@@ -28,6 +31,7 @@ public:
 		mpeg.setFrameCallback(frameCallback);
 #if MD_MPEG_ENABLE_MPEG2
 		a52.setFrameCallback(frameCallback);
+		lpcm.setFrameCallback(frameCallback);
 #endif
 	}
 
@@ -36,6 +40,9 @@ public:
 #if MD_MPEG_ENABLE_MPEG2
 		if (a52.firstFramePtsMillis() >= 0) {
 			return a52.firstFramePtsMillis();
+		}
+		if (lpcm.firstFramePtsMillis() >= 0) {
+			return lpcm.firstFramePtsMillis();
 		}
 #endif
 		return mpeg.firstFramePtsMillis();
@@ -64,6 +71,7 @@ public:
 		mpeg.reset();
 #if MD_MPEG_ENABLE_MPEG2
 		a52.reset();
+		lpcm.reset();
 #endif
 	}
 };
