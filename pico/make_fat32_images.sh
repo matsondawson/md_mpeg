@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Makes the FAT images fat32_test checks, in the given directory. Needs dosfstools and mtools.
+# Makes the FAT images card_volume_test checks, in the given directory. Needs dosfstools and mtools.
 set -euo pipefail
 
 cd "$1"
@@ -7,14 +7,16 @@ export MTOOLS_SKIP_CHECK=1
 
 head -c 1000 /dev/urandom > small.bin
 head -c 512 /dev/urandom > onesect.bin
-# 4 KiB clusters below
-head -c 4096 /dev/urandom > onecluster.bin
+# 512 byte clusters below
+head -c 512 /dev/urandom > onecluster.bin
 head -c 300000 /dev/urandom > frag.bin
 head -c 60000 /dev/urandom > filler.bin
 head -c 60000 /dev/urandom > deleted.bin
 
+# 512 byte clusters: about 80000 of them, enough to be FAT32 by the specification's cluster count (65525 or
+# more), which is how fat-fs tells the FAT types apart
 truncate -s 40M whole.img
-mkfs.fat -F 32 -S 512 -s 8 whole.img > /dev/null
+mkfs.fat -F 32 -S 512 -s 1 whole.img > /dev/null
 
 mcopy -i whole.img small.bin ::SMALL.BIN
 mcopy -i whole.img onesect.bin ::ONESECT.BIN
@@ -38,7 +40,7 @@ mcopy -i whole.img small.bin ::SUBDIR/INSUB.BIN
 # A long name, which the 8.3 name beside it stands in for
 mcopy -i whole.img small.bin "::A long file name.bin"
 
-# Enough entries that the root directory spans clusters: 4 KiB holds 128
+# Enough entries that the root directory spans clusters: 512 bytes hold 16
 for i in $(seq 1 150); do
 	mcopy -i whole.img small.bin "::F$i.BIN"
 done

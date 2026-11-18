@@ -3,7 +3,7 @@
 #
 #   pico/pico.sh [options] build [clip.mpg]   Build the image and every app, embedding part of the clip.
 #   pico/pico.sh [options] flash [target]     Flash benchmark_flash (default), video_player, video_player_sd or display_test. The board must be connected.
-#   pico/pico.sh test                         Test the FAT32 code and display drivers on the desktop
+#   pico/pico.sh test                         Test the SD card volume code and display drivers on the desktop
 #   pico/pico.sh monitor [seconds]            Print the board's USB serial output, default 180 s
 #
 # Options:
@@ -74,12 +74,13 @@ case "${1:-}" in
 		;;
 	test)
 		docker build -q -t "$IMAGE" "$ROOT/pico" > /dev/null
-		dir=pico/build/fat32_test
+		dir=pico/build/host_test
 		rm -rf "${ROOT:?}/$dir"
-		mkdir -p "$ROOT/$dir"
-		in_docker pico/make_fat32_images.sh "$dir"
-		in_docker g++ -std=c++20 -O1 -g -Wall -Wextra -fsanitize=address,undefined -Ipico pico/fat32_test.cpp -o "$dir/fat32_test"
-		in_docker "$dir/fat32_test" "$dir"
+		mkdir -p "$ROOT/$dir/images"
+		in_docker pico/make_fat32_images.sh "$dir/images"
+		in_docker cmake -S pico/host_test -B "$dir" -G Ninja -DCMAKE_BUILD_TYPE=Debug > /dev/null
+		in_docker cmake --build "$dir"
+		in_docker "$dir/card_volume_test" "$dir/images"
 		in_docker g++ -std=c++20 -O1 -g -Wall -Wextra -fsanitize=address,undefined -Idisplay pico/display_drivers_test.cpp \
 			-o "$dir/display_drivers_test"
 		in_docker "$dir/display_drivers_test"

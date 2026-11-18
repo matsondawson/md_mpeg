@@ -1,6 +1,5 @@
-// Reads the first .MPG on the SD card the way the player does, a byte at a time, and times it.
-// Built twice: sd_benchmark with the fat-fs library (CardVolume.h), sd_benchmark_old with SdCard.h and
-// Fat32.h, so the two can be compared on the same card and file.
+// Reads the first .MPG on the SD card the way the player does, a byte at a time, and times it, with and
+// without work between sectors as the decoder would do.
 
 #include <algorithm>
 #include <cstdio>
@@ -10,41 +9,24 @@
 #include "Clocks.h"
 #include "pico/stdlib.h"
 
-#if SD_BENCHMARK_FAT_FS
 #include "CardVolume.h"
 #include "PicoSdCard.h"
-#else
-#include "Fat32.h"
-#include "SdCard.h"
-#endif
 
 namespace {
 	// Bytes read per run, or the whole file if it's smaller
 	constexpr uint32_t READ_BYTES = 4 * 1024 * 1024;
 	constexpr int RUNS = 3;
 
-#if SD_BENCHMARK_FAT_FS
 	using Volume = CardVolume;
+	// SPI1: SCK GP10, MOSI GP11, MISO GP12, CS GP13
 	Mfs::PicoSdCard s_card(spi1, 10, 11, 12, 13);
-#else
-	using Volume = Fat32<SdCard>;
-	SdCard s_card;
-#endif
 	Volume s_volume(s_card);
 
 	const char *startCard() {
-#if SD_BENCHMARK_FAT_FS
 		if (s_card.begin() != 0) {
 			return s_card.lastError();
 		}
 		return s_volume.mount();
-#else
-		if (const char *error = s_card.init()) {
-			return error;
-		}
-		const char *error = nullptr;
-		return s_volume.mount(error) ? nullptr : error;
-#endif
 	}
 
 	void busyWait(const uint32_t us) {
@@ -94,8 +76,7 @@ namespace {
 			return;
 		}
 		const uint32_t bytes = std::min(READ_BYTES, video.size);
-		printf("%s: %s, first %lu bytes, %d runs each\n", SD_BENCHMARK_FAT_FS ? "fat-fs" : "old", video.name, bytes,
-		       RUNS);
+		printf("%s, first %lu bytes, %d runs each\n", video.name, bytes, RUNS);
 		for (const uint32_t workUs : {0u, 250u}) {
 			uint32_t best = UINT32_MAX, worst = 0, checksum = 0;
 			for (int run = 0; run < RUNS; run++) {

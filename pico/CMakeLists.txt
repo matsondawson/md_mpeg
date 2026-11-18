@@ -16,15 +16,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 pico_sdk_init()
 
 # The SD card and FAT volume, for video_player_sd
-include(FetchContent)
-FetchContent_Declare(fat
-	GIT_REPOSITORY https://github.com/matsondawson/fat-fs.git
-	GIT_TAG v0.1.0)
-# Only FAT32, as before, with no block cache: the card driver streams and reads ahead itself
-set(FAT_LONG_FILE_NAMES OFF CACHE BOOL "" FORCE)
-set(FAT_BLOCK_CACHE OFF CACHE BOOL "" FORCE)
-set(FAT_FAT12_16 OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(fat)
+include(fat-fs.cmake)
 
 set(MD_MPEG_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(MD_MPEG_DISPLAY_DRIVERS "${CMAKE_CURRENT_SOURCE_DIR}/../display")
@@ -144,17 +136,12 @@ foreach(player video_player video_player_sd)
 	)
 endforeach()
 
-# Times reading a file from the SD card: sd_benchmark with fat-fs, sd_benchmark_old with SdCard.h and Fat32.h
-foreach(benchmark sd_benchmark sd_benchmark_old)
-	add_executable(${benchmark} sd_benchmark.cpp)
-	target_link_libraries(${benchmark} PRIVATE pico_stdlib hardware_dma hardware_spi hardware_vreg)
-	pico_enable_stdio_usb(${benchmark} 1)
-	pico_enable_stdio_uart(${benchmark} 0)
-	pico_add_extra_outputs(${benchmark})
-endforeach()
-target_compile_definitions(sd_benchmark PRIVATE SD_BENCHMARK_FAT_FS=1)
-target_link_libraries(sd_benchmark PRIVATE fat::fat fat::pico_sd)
-target_compile_definitions(sd_benchmark_old PRIVATE SD_BENCHMARK_FAT_FS=0)
+# Times reading a file from the SD card the way the player does
+add_executable(sd_benchmark sd_benchmark.cpp)
+target_link_libraries(sd_benchmark PRIVATE pico_stdlib hardware_vreg fat::fat fat::pico_sd)
+pico_enable_stdio_usb(sd_benchmark 1)
+pico_enable_stdio_uart(sd_benchmark 0)
+pico_add_extra_outputs(sd_benchmark)
 
 add_executable(display_test display_test.cpp)
 target_link_libraries(display_test PRIVATE pico_stdlib hardware_vreg)

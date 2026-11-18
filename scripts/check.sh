@@ -11,7 +11,7 @@
 #   desktop-asan     Decoder tests built with AddressSanitizer and UndefinedBehaviorSanitizer
 #   desktop-pico-options  Decoder tests with the Pico's decoder options: mono audio, MPEG-1 only, no diagnostic messages
 #   desktop-float    Decoder tests with floating point audio and the full IDCT
-#   pico-host        FAT32 and display driver tests on the desktop (pico/pico.sh test)
+#   pico-host        SD card volume and display driver tests on the desktop (pico/pico.sh test)
 #   pico-asm         The Pico's Cortex-M0+ assembler run in an emulator against the decoder's C (tests/asm_check.py)
 #   pico             Pico (RP2040) build of every app
 #   pico2            Pico 2 (RP2350) build of every app
