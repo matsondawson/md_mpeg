@@ -15,6 +15,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 pico_sdk_init()
 
+# The SD card and FAT volume, for video_player_sd
+include(fat-fs.cmake)
+
 set(MD_MPEG_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 set(MD_MPEG_DISPLAY_DRIVERS "${CMAKE_CURRENT_SOURCE_DIR}/../display")
 
@@ -123,6 +126,7 @@ option(MD_MPEG_PICO_AUDIO_ON_CORE1 "Decode audio on core 1, between frame scans,
 add_decoder_app(video_player video_player.cpp)
 add_decoder_app(video_player_sd video_player.cpp)
 target_compile_definitions(video_player_sd PRIVATE VIDEO_FROM_SD=1)
+target_link_libraries(video_player_sd PRIVATE fat::fat fat::pico_sd)
 foreach(player video_player video_player_sd)
 	use_display(${player})
 	target_compile_definitions(${player} PRIVATE
@@ -131,6 +135,13 @@ foreach(player video_player video_player_sd)
 		MD_MPEG_AUDIO_IN_RAM=$<BOOL:${MD_MPEG_PICO_AUDIO_ON_CORE1}>
 	)
 endforeach()
+
+# Times reading a file from the SD card the way the player does
+add_executable(sd_benchmark sd_benchmark.cpp)
+target_link_libraries(sd_benchmark PRIVATE pico_stdlib hardware_vreg fat::fat fat::pico_sd)
+pico_enable_stdio_usb(sd_benchmark 1)
+pico_enable_stdio_uart(sd_benchmark 0)
+pico_add_extra_outputs(sd_benchmark)
 
 add_executable(display_test display_test.cpp)
 target_link_libraries(display_test PRIVATE pico_stdlib hardware_vreg)

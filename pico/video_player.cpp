@@ -39,8 +39,8 @@
 
 #if VIDEO_FROM_SD
 #include "Button.h"
-#include "Fat32.h"
-#include "SdCard.h"
+#include "CardVolume.h"
+#include "PicoSdCard.h"
 #else
 extern "C" const uint8_t clip_start[];
 extern "C" const uint8_t clip_end[];
@@ -271,29 +271,38 @@ namespace {
 
 #if VIDEO_FROM_SD
 	// Counts the time reading blocks the decoder
-	class TimedCard {
-		SdCard &m_card;
+	class TimedCard final : public Mfs::SectorDevice {
+		Mfs::SectorDevice &m_card;
 
 	public:
 		uint32_t totalUs = 0;
 		uint32_t maxUs = 0;
 
-		explicit TimedCard(SdCard &card) : m_card(card) {
+		explicit TimedCard(Mfs::SectorDevice &card) : m_card(card) {
 		}
 
-		bool readSector(const uint32_t lba, uint8_t *buffer) {
+		Mfs::md_error_t read(uint8_t *data, const Mfs::sector_t sector) override {
 			const uint32_t start = time_us_32();
-			const bool ok = m_card.readSector(lba, buffer);
+			const Mfs::md_error_t error = m_card.read(data, sector);
 			const uint32_t us = time_us_32() - start;
 			totalUs += us;
 			maxUs = std::max(maxUs, us);
-			return ok;
+			return error;
 		}
+
+		Mfs::md_error_t write(const uint8_t *data, const Mfs::sector_t sector) override {
+			return m_card.write(data, sector);
+		}
+
+		uint32_t getBytesPerSector() const override { return m_card.getBytesPerSector(); }
+
+		Mfs::md_error_t flush() override { return m_card.flush(); }
 	};
 
-	using Volume = Fat32<TimedCard>;
+	using Volume = CardVolume;
 
-	SdCard s_card;
+	// SD card on SPI1: SCK GP10, MOSI GP11, MISO GP12, CS GP13
+	Mfs::PicoSdCard s_card(spi1, 10, 11, 12, 13);
 	TimedCard s_timedCard(s_card);
 	Volume s_volume(s_timedCard);
 
@@ -586,12 +595,11 @@ int main() {
 	uint32_t fileIndex = 0;
 	for (;;) {
 		try {
-			if (const char *error = s_card.init()) {
-				fail(error, COLOR_RED);
+			if (s_card.begin() != 0) {
+				fail(s_card.lastError(), COLOR_RED);
 				continue;
 			}
-			const char *mountError = nullptr;
-			if (!s_volume.mount(mountError)) {
+			if (const char *mountError = s_volume.mount()) {
 				fail(mountError, COLOR_RED);
 				continue;
 			}
